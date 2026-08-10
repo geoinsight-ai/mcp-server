@@ -1,93 +1,166 @@
-# mcp-server
+# ogc-dggs-mcp
 
+An MCP (Model Context Protocol) server, written in Rust with [rmcp](https://github.com/modelcontextprotocol/rust-sdk),
+that exposes geoinsight's [`ogc-dggs-api`](../ogc-dggs-api) as **task-shaped** tools for
+LLM agents — not a 1:1 mirror of the REST API.
 
+The API's real value is answering "what's the NDVI here" or "any burn scar here",
+not "list me some DGGS zones" — DGGRS/zone mechanics are how the data is indexed, not
+something a caller should have to reason about. So `get_insight` does the whole job
+internally (resolve concept → collection → resolution → covering zone(s) → per-property
+aggregation) and returns one clean answer. Zones, DGGRS grids, schemas and admin/order
+routes are deliberately **not** exposed as tools at all.
 
-## Getting started
+## Tools
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+| Tool | What it does | Backend calls it composes |
+| --- | --- | --- |
+| `list_insights` | List available concepts (NDVI, burn scar analysis, ...) | `GET /concepts` |
+| `get_insight` | The main tool: one aggregated value of an insight at a point or over an area | `GET /concepts/{id}`, `GET /collections/{id}/dggs`, `GET .../zones`, `GET .../zones/{id}/data` (×N, concurrently), `GET /collections/{id}/queryables` |
+| `get_data` | Raw, unaggregated field values from one or more named collections at a location, optionally joined in one call | `GET /collections/{id}/dggs`, `GET .../zones`, `POST /dggs/{id}/zones/{id}/data` (×N, concurrently) |
+| `list_collections` | Browse raw dataset metadata directly (secondary/advanced) | `GET /collections` |
+| `get_collection` | Describe one dataset directly (secondary/advanced) | `GET /collections/{id}` |
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+`list_insights` and `get_insight` need this server's Auth0 client-credentials configured
+— they call `/concepts`, the one route the backend guards with a bearer token.
+`get_data`, `list_collections` and `get_collection` are open and work without it.
 
-## Add your files
+### How `get_insight` works
 
-* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+Given an insight (by name or id) and a location (`lon`/`lat`, or a
+`min_lon`/`min_lat`/`max_lon`/`max_lat` box):
 
+1. Resolve the insight to a concept (`GET /concepts/{id}`), which carries which
+   collection(s) serve it and the DGGS resolution to sample at
+   (`processing[].dggs_refinement_level`).
+2. Find the DGGRS grid for that collection (`GET /collections/{id}/dggs`, first entry
+   unless overridden).
+3. Find the zone(s) at that resolution covering the location (`GET .../zones` with a
+   bbox filter — a point is expanded to a small epsilon box first; see gotcha below).
+4. Fetch each zone's own value (`GET .../zones/{id}/data?zone-depth=0`, one call per
+   zone, capped at 64 and run concurrently).
+5. Reduce each property across the sampled zones using **that property's own
+   configured statistic** (`gi_dggs_stat` from `GET /collections/{id}/queryables` — e.g.
+   `mean` for a numeric property like NDVI, `majority` for a categorical one like a
+   country name), not a hardcoded guess. Numeric properties support
+   `mean`/`sum`/`min`/`max`/`count`; anything non-numeric falls back to a majority vote
+   across the sampled zones.
+
+The result is one JSON object: the insight, which collection/grid/resolution were used,
+how many zones were sampled, and a `values` map of `{ value, stat, unit, sampled_zones }`
+per property.
+
+### `get_data`: raw values, your choice of collection(s)
+
+`get_insight` is concept-first and aggregated; `get_data` is the lower-level sibling for
+when you already know the collection(s)/field(s) you want and want the actual per-zone
+values, not a single reduced number. Given a location and a `collections` array (each
+`{ collection_id, fields, alias?, filter? }`, mirroring the backend's cross-collection
+body), it:
+
+1. Picks a DGGRS grid (first listed collection's `GET .../dggs`, preferring `IVEA7H`
+   when available — see gotcha below — unless overridden).
+2. Resolves the location to zone(s) at `zone_level` (default 9), same as `get_insight`.
+3. `POST`s `/dggs/{dggrs_id}/zones/{zone_id}/data` once per zone (capped at 64,
+   concurrent), with the `collections` array as the body. Fields from different
+   collections come back joined on the same zone, as `prefix__field` columns
+   (`prefix` = `alias` or `collection_id`) — this is how you pull e.g. elevation and a
+   country name together in one call instead of two separate lookups.
+4. Returns the backend's own DGGS-JSON per sampled zone, unmodified — no aggregation,
+   by design.
+
+`zone_depth` (default `"0"`, one value per zone) passes straight through to the
+backend's own zone-depth expansion if you want finer detail *within* a resolved zone;
+be aware that expanding it can return a lot of values very fast (thousands, not
+gotcha-free — see below).
+
+**Known backend gotchas** (found via live testing against `api-dev.geoinsight.ai`,
+independent of this server, worth their own bug reports against `ogc-dggs-api`):
+
+- The bbox filter treats an exact `min == max` (degenerate/point) box as unbounded and
+  returns effectively the whole global grid instead of the single containing zone. Both
+  `get_insight` and `get_data` work around this by expanding a point to a ±0.0005° box
+  before querying.
+- The DGGRID-backed grids (`ISEA3HDGGRID` — which happens to sort first in every
+  collection's DGGRS list — and likely its siblings) can 500 on zone data at finer
+  resolutions with `"No regions: bbox is empty"`, reproducible with plain `curl`,
+  unrelated to this server. Both `get_insight` and `get_data` default to `IVEA7H`
+  instead of "whichever grid sorts first" for exactly this reason; override `dggrs_id`
+  explicitly if you need a different grid and hit this.
+- `GET .../data` without an explicit `zone-depth` picks a server-chosen `defaultDepth`
+  that can be surprisingly deep (thousands of values for one small zone) — both tools
+  always pass `zone-depth=0` unless you override it, to keep responses bounded.
+
+**Not handled yet**: place names ("Lisbon") aren't geocoded — both tools take
+coordinates only, relying on the calling agent's own geographic knowledge to turn a
+place into a point/bbox. Revisit if that turns out not to be precise enough.
+
+Every tool returns JSON, pretty-printed. Non-2xx responses become an MCP tool error
+whose `data` field carries the backend's own error body (the API includes a helpful
+`hint` field, e.g. listing valid DGGRS ids on a 404).
+
+## Configuration
+
+All configuration is via environment variables.
+
+| Variable | Required | Default | Purpose |
+| --- | --- | --- | --- |
+| `OGC_DGGS_API_BASE_URL` | no | `http://localhost:30001` | Base URL of the ogc-dggs-api instance to call |
+| `AUTH0_DOMAIN` | only for `list_insights`/`get_insight` | — | Auth0 tenant domain, e.g. `geoinsight.us.auth0.com` |
+| `AUTH0_CLIENT_ID` | only for `list_insights`/`get_insight` | — | Auth0 M2M application client id |
+| `AUTH0_CLIENT_SECRET` | only for `list_insights`/`get_insight` | — | Auth0 M2M application client secret |
+| `AUTH0_AUDIENCE` | only for `list_insights`/`get_insight` | — | API identifier configured on the Auth0 API (same value the ogc-dggs-api validates as `AUTH0_AUDIENCE`) |
+| `RUST_LOG` | no | `info` | Standard `tracing` filter |
+
+The server uses the Auth0 client-credentials (machine-to-machine) grant: it fetches a
+token from `https://{AUTH0_DOMAIN}/oauth/token` and caches/refreshes it automatically.
+All four `AUTH0_*` variables must be set together or auth is left disabled (`get_data`,
+`list_collections`/`get_collection` still work without it; `list_insights`/`get_insight`
+will fail with the backend's own 401).
+
+## Build
+
+```sh
+cargo build --release
 ```
-cd existing_repo
-git remote add origin https://gitlab.com/geoinsight/mcp-server.git
-git branch -M DEV
-git push -uf origin DEV
+
+The binary is `target/release/ogc-dggs-mcp`.
+
+## Run with Claude Code / Claude Desktop
+
+Add to your MCP config (e.g. `claude_desktop_config.json`, or via `claude mcp add`):
+
+```json
+{
+  "mcpServers": {
+    "ogc-dggs": {
+      "command": "/absolute/path/to/target/release/ogc-dggs-mcp",
+      "env": {
+        "OGC_DGGS_API_BASE_URL": "https://api-dev.geoinsight.ai",
+        "AUTH0_DOMAIN": "your-tenant.us.auth0.com",
+        "AUTH0_CLIENT_ID": "...",
+        "AUTH0_CLIENT_SECRET": "...",
+        "AUTH0_AUDIENCE": "..."
+      }
+    }
+  }
+}
 ```
 
-## Integrate with your tools
+Point `OGC_DGGS_API_BASE_URL` at whichever deployment you want:
+`http://localhost:30001` (local dev), `https://api-dev.geoinsight.ai`, or
+`https://api-mr.geoinsight.ai`.
 
-* [Set up project integrations](https://gitlab.com/geoinsight/mcp-server/-/settings/integrations)
+The server talks JSON-RPC over stdio — it must not print anything to stdout itself;
+all logs go to stderr via `tracing`.
 
-## Collaborate with your team
+## Project layout
 
-* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
-
-## Test and Deploy
-
-Use the built-in continuous integration in GitLab.
-
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
-
-***
-
-# Editing this README
-
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
-
-## Suggestions for a good README
-
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
-
-## Name
-Choose a self-explaining name for your project.
-
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
-
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
-
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
-
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
-
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
-
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
-
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
-
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+- `src/config.rs` — env var loading
+- `src/auth.rs` — Auth0 client-credentials token fetch/cache
+- `src/client.rs` — thin reqwest wrapper: builds requests, attaches auth, maps HTTP
+  errors to MCP tool errors
+- `src/server.rs` — the `DggsServer` tool router: 5 task-shaped `#[tool]`s, backed by
+  private helper methods (concept resolution, DGGRS/zone lookup, per-zone data fetch,
+  queryables-driven reduction) that compose several backend calls per tool
+- `src/main.rs` — wiring + stdio transport
