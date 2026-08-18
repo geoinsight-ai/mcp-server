@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use rmcp::ErrorData as McpError;
 use serde_json::Value;
 
@@ -12,6 +14,10 @@ pub struct ApiClient {
     http: reqwest::Client,
     base_url: String,
     token_provider: Option<TokenProvider>,
+    /// Total requests sent to ogc-dggs-api this process, logged per-request
+    /// (see `send`) so a single tool call's real fan-out (e.g. `get_insight`
+    /// hitting several zones) is visible, not just the one MCP tool call.
+    request_count: AtomicU64,
 }
 
 impl ApiClient {
@@ -30,7 +36,13 @@ impl ApiClient {
             http,
             base_url: config.base_url.clone(),
             token_provider,
+            request_count: AtomicU64::new(0),
         }
+    }
+
+    /// Requests sent to ogc-dggs-api so far this process.
+    pub fn request_count(&self) -> u64 {
+        self.request_count.load(Ordering::Relaxed)
     }
 
     /// GET `{base_url}{path}` with the given query pairs, attaching a bearer
@@ -40,7 +52,7 @@ impl ApiClient {
     pub async fn get_json(&self, path: &str, query: &[(&str, String)]) -> Result<Value, McpError> {
         let url = format!("{}{}", self.base_url, path);
         let request = self.http.get(&url).query(query);
-        self.send(request, url).await
+        self.send(request, "GET", url).await
     }
 
     /// POST `{base_url}{path}` with a JSON body and the given query pairs,
@@ -53,10 +65,15 @@ impl ApiClient {
     ) -> Result<Value, McpError> {
         let url = format!("{}{}", self.base_url, path);
         let request = self.http.post(&url).query(query).json(body);
-        self.send(request, url).await
+        self.send(request, "POST", url).await
     }
 
-    async fn send(&self, mut request: reqwest::RequestBuilder, url: String) -> Result<Value, McpError> {
+    async fn send(
+        &self,
+        mut request: reqwest::RequestBuilder,
+        method: &'static str,
+        url: String,
+    ) -> Result<Value, McpError> {
         if let Some(token_provider) = &self.token_provider {
             let token = token_provider.token().await.map_err(|err| {
                 McpError::internal_error(
@@ -67,7 +84,10 @@ impl ApiClient {
             request = request.header("Authorization", format!("Bearer {token}"));
         }
 
+        let request_number = self.request_count.fetch_add(1, Ordering::Relaxed) + 1;
+
         let response = request.send().await.map_err(|err| {
+            tracing::info!(request_number, method, %url, error = %err, "ogc-dggs-api call failed");
             McpError::internal_error(
                 format!("request to ogc-dggs-api ({url}) failed: {err}"),
                 None,
@@ -75,6 +95,8 @@ impl ApiClient {
         })?;
 
         let status = response.status();
+        tracing::info!(request_number, method, %url, status = status.as_u16(), "ogc-dggs-api call");
+
         let body = response.text().await.unwrap_or_default();
 
         if !status.is_success() {

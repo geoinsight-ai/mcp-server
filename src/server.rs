@@ -606,6 +606,15 @@ impl DggsServer {
         let body = self.client.get_json(&path, &[]).await?;
         Ok(pretty(&body))
     }
+
+    #[tool(
+        description = "How many HTTP requests this server has sent to ogc-dggs-api so far this session. Useful for understanding real load: a single get_insight/get_data call can fan out to many backend requests (one per sampled zone, plus lookups), not just one."
+    )]
+    async fn get_call_stats(&self) -> String {
+        pretty(&serde_json::json!({
+            "requests_to_ogc_dggs_api": self.client.request_count(),
+        }))
+    }
 }
 
 #[tool_handler]
@@ -622,7 +631,8 @@ impl ServerHandler for DggsServer {
              path for browsing raw dataset metadata. list_insights and get_insight call the \
              bearer-token-gated /concepts route, so they need this server's Auth0 \
              client-credentials configured; get_data, list_collections and get_collection work \
-             without it.",
+             without it. get_call_stats reports how many backend HTTP requests this session \
+             has made in total, since a single get_insight/get_data call can fan out to many.",
         )
     }
 }

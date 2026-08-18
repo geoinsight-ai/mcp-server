@@ -1,8 +1,11 @@
 use std::env;
+use std::net::SocketAddr;
 
-/// Auth0 machine-to-machine (client-credentials) configuration for calling
-/// endpoints on the ogc-dggs-api that require a bearer token (e.g.
-/// `/concepts`). Optional: unauthenticated tools keep working without it.
+/// Auth0 machine-to-machine (client-credentials) configuration this server
+/// uses to mint its OWN token when calling endpoints on ogc-dggs-api that
+/// require a bearer token (e.g. `/concepts`). Only meaningful in stdio mode,
+/// where this process has one fixed identity. Optional: unauthenticated
+/// tools keep working without it.
 #[derive(Debug, Clone)]
 pub struct Auth0Config {
     pub domain: String,
@@ -11,17 +14,41 @@ pub struct Auth0Config {
     pub audience: String,
 }
 
+/// Domain + audience needed to validate an *incoming caller's* JWT
+/// (JWKS/RS256). Distinct from [`Auth0Config`]: no client id/secret — HTTP
+/// mode never mints its own token, it only checks and forwards the caller's.
+#[derive(Debug, Clone)]
+pub struct Auth0ValidationConfig {
+    pub domain: String,
+    pub audience: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum Transport {
+    /// Local process, one fixed caller identity via `Auth0Config`. Used by
+    /// Claude Desktop/Code today.
+    Stdio,
+    /// Customer-facing HTTP service: every request must carry its own bearer
+    /// token, validated against `Auth0ValidationConfig` and forwarded as-is
+    /// to ogc-dggs-api. No server-wide service identity involved.
+    Http { bind_addr: SocketAddr },
+}
+
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     /// Base URL of the ogc-dggs-api instance, e.g. `http://localhost:30001`.
     pub base_url: String,
+    pub transport: Transport,
+    /// Only set (and only used) for stdio mode.
     pub auth0: Option<Auth0Config>,
+    /// Only set (and required) for HTTP mode.
+    pub http_auth: Option<Auth0ValidationConfig>,
 }
 
 impl AppConfig {
     pub fn from_env() -> Self {
         let base_url = env::var("OGC_DGGS_API_BASE_URL")
-            .unwrap_or_else(|_| "http://localhost:30001".to_string())
+            .unwrap_or_else(|_| "http://localhost:3001".to_string())
             .trim_end_matches('/')
             .to_string();
 
@@ -40,6 +67,38 @@ impl AppConfig {
             _ => None,
         };
 
-        Self { base_url, auth0 }
+        let transport_kind = env::var("MCP_TRANSPORT").unwrap_or_else(|_| "stdio".to_string());
+        let transport = match transport_kind.as_str() {
+            "stdio" => Transport::Stdio,
+            "http" => {
+                let bind_addr = env::var("MCP_HTTP_BIND_ADDR")
+                    .unwrap_or_else(|_| "0.0.0.0:8080".to_string())
+                    .parse::<SocketAddr>()
+                    .unwrap_or_else(|e| panic!("MCP_HTTP_BIND_ADDR is not a valid address: {e}"));
+                Transport::Http { bind_addr }
+            }
+            other => panic!("MCP_TRANSPORT must be \"stdio\" or \"http\", got {other:?}"),
+        };
+
+        // HTTP mode validates every caller's own token instead of minting
+        // one service-wide token, so it needs domain+audience regardless of
+        // whether the four AUTH0_* vars above happen to be set too — there
+        // is no safe way to serve a single request without a validator.
+        let http_auth = match (env::var("AUTH0_DOMAIN"), env::var("AUTH0_AUDIENCE")) {
+            (Ok(domain), Ok(audience)) => Some(Auth0ValidationConfig { domain, audience }),
+            _ => None,
+        };
+        if matches!(transport, Transport::Http { .. }) && http_auth.is_none() {
+            panic!(
+                "MCP_TRANSPORT=http requires AUTH0_DOMAIN and AUTH0_AUDIENCE to validate incoming callers"
+            );
+        }
+
+        Self {
+            base_url,
+            transport,
+            auth0,
+            http_auth,
+        }
     }
 }
