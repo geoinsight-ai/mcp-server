@@ -31,7 +31,14 @@ pub enum Transport {
     /// Customer-facing HTTP service: every request must carry its own bearer
     /// token, validated against `Auth0ValidationConfig` and forwarded as-is
     /// to ogc-dggs-api. No server-wide service identity involved.
-    Http { bind_addr: SocketAddr },
+    Http {
+        bind_addr: SocketAddr,
+        /// Hostnames the `Host` header is allowed to carry (DNS-rebinding
+        /// guard). Left at rmcp's loopback-only default for local runs;
+        /// MUST be set to the real ingress hostname(s) in any real
+        /// deployment or every request 400s on Host validation.
+        allowed_hosts: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +50,22 @@ pub struct AppConfig {
     pub auth0: Option<Auth0Config>,
     /// Only set (and required) for HTTP mode.
     pub http_auth: Option<Auth0ValidationConfig>,
+}
+
+/// `AUTH0_DOMAIN` is documented (and used internally here) as a bare host
+/// with no scheme, e.g. `geoinsight-dev.eu.auth0.com` — but ogc-dggs-api's
+/// own deployed value for the very same tenant is `https://geoinsight-dev.eu.auth0.com`
+/// (confirmed in `deployment/creodias/ogc-dggs-api/overlays/*/patch-env.yaml`),
+/// and the two must reference the same tenant/audience by construction. An
+/// operator copying that value verbatim is the likely case, not an edge
+/// case, so accept either form here instead of documenting a gotcha and
+/// hoping nobody copy-pastes it wrong.
+fn strip_scheme(domain: String) -> String {
+    domain
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string()
 }
 
 impl AppConfig {
@@ -59,7 +82,7 @@ impl AppConfig {
             env::var("AUTH0_AUDIENCE"),
         ) {
             (Ok(domain), Ok(client_id), Ok(client_secret), Ok(audience)) => Some(Auth0Config {
-                domain,
+                domain: strip_scheme(domain),
                 client_id,
                 client_secret,
                 audience,
@@ -75,7 +98,11 @@ impl AppConfig {
                     .unwrap_or_else(|_| "0.0.0.0:8080".to_string())
                     .parse::<SocketAddr>()
                     .unwrap_or_else(|e| panic!("MCP_HTTP_BIND_ADDR is not a valid address: {e}"));
-                Transport::Http { bind_addr }
+                let allowed_hosts = match env::var("MCP_HTTP_ALLOWED_HOST") {
+                    Ok(hosts) => hosts.split(',').map(|h| h.trim().to_string()).collect(),
+                    Err(_) => vec!["localhost".to_string(), "127.0.0.1".to_string(), "::1".to_string()],
+                };
+                Transport::Http { bind_addr, allowed_hosts }
             }
             other => panic!("MCP_TRANSPORT must be \"stdio\" or \"http\", got {other:?}"),
         };
@@ -85,7 +112,10 @@ impl AppConfig {
         // whether the four AUTH0_* vars above happen to be set too — there
         // is no safe way to serve a single request without a validator.
         let http_auth = match (env::var("AUTH0_DOMAIN"), env::var("AUTH0_AUDIENCE")) {
-            (Ok(domain), Ok(audience)) => Some(Auth0ValidationConfig { domain, audience }),
+            (Ok(domain), Ok(audience)) => Some(Auth0ValidationConfig {
+                domain: strip_scheme(domain),
+                audience,
+            }),
             _ => None,
         };
         if matches!(transport, Transport::Http { .. }) && http_auth.is_none() {
@@ -100,5 +130,18 @@ impl AppConfig {
             auth0,
             http_auth,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_scheme_handles_both_forms_and_trailing_slash() {
+        assert_eq!(strip_scheme("geoinsight-dev.eu.auth0.com".to_string()), "geoinsight-dev.eu.auth0.com");
+        assert_eq!(strip_scheme("https://geoinsight-dev.eu.auth0.com".to_string()), "geoinsight-dev.eu.auth0.com");
+        assert_eq!(strip_scheme("http://geoinsight-dev.eu.auth0.com".to_string()), "geoinsight-dev.eu.auth0.com");
+        assert_eq!(strip_scheme("https://geoinsight-dev.eu.auth0.com/".to_string()), "geoinsight-dev.eu.auth0.com");
     }
 }

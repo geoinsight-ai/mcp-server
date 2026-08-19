@@ -1,0 +1,133 @@
+image: docker:26
+
+services:
+  - name: docker:26-dind
+    alias: docker
+
+variables:
+  DOCKER_HOST: tcp://docker:2376
+  DOCKER_TLS_CERTDIR: "/certs"
+  DOCKER_DRIVER: overlay2
+  GIT_DEPTH: 0
+
+stages:
+  - build
+  - test
+
+# Every dependency here is a public crates.io crate (no gdal-sys, no private
+# git deps, no GDAL/DGGRID install), so unlike ogc-dggs-api's test job this
+# just needs the stock Rust image — same one the Dockerfile's build stage
+# uses, so the tests run against the same toolchain the shipped image does.
+test:rust:
+  tags:
+    - our-server
+  image: rust:1-slim-bookworm
+  stage: test
+  services: []
+  script:
+    - cargo test --release
+    # slim-bookworm doesn't ship clippy by default (unlike the full rust
+    # image) — the component has to be installed explicitly.
+    - rustup component add clippy
+    - cargo clippy --all-targets -- -D warnings
+
+build:docker:
+  tags:
+    - our-server
+  stage: build
+  image: docker:26
+  services:
+    - name: docker:26-dind
+      alias: docker
+  variables:
+    DOCKER_BUILDKIT: "1"
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" "$CI_REGISTRY" --password-stdin
+    - docker context inspect ci-ctx >/dev/null 2>&1 || docker context create ci-ctx --docker "host=$DOCKER_HOST,ca=$DOCKER_TLS_CERTDIR/client/ca.pem,cert=$DOCKER_TLS_CERTDIR/client/cert.pem,key=$DOCKER_TLS_CERTDIR/client/key.pem"
+    - docker buildx inspect cibuilder >/dev/null 2>&1 || docker buildx create --name cibuilder --driver docker-container --use ci-ctx --bootstrap
+    - docker buildx use cibuilder
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_IID'
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_COMMIT_BRANCH == "DEV"'
+    - if: '$CI_COMMIT_BRANCH == "PROD"'
+  script:
+    - |
+      IMAGE="$CI_REGISTRY_IMAGE"
+      if [ "$CI_PIPELINE_SOURCE" = "merge_request_event" ] && [ -n "$CI_MERGE_REQUEST_IID" ]; then
+        TAGS="mr-$CI_MERGE_REQUEST_IID-$CI_COMMIT_SHORT_SHA"
+      elif [ -n "$CI_COMMIT_TAG" ]; then
+        TAGS="$CI_COMMIT_TAG_SLUG"
+      else
+        # Moving tag (dev/prod) plus an immutable per-commit tag, same
+        # reasoning as ogc-dggs-api: no :latest, so a deploy always pins an
+        # exact build rather than whatever happened to be pushed last.
+        TAGS="$CI_COMMIT_REF_SLUG $CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA"
+      fi
+      echo "Building $IMAGE with tags: $TAGS"
+    - |
+      TAG_ARGS=""
+      for T in $TAGS; do TAG_ARGS="$TAG_ARGS -t $CI_REGISTRY_IMAGE:$T"; done
+      docker buildx build --push \
+        --provenance=false \
+        --sbom=false \
+        --build-arg GIT_SHA=$CI_COMMIT_SHORT_SHA \
+        --build-arg GIT_REF=$CI_COMMIT_REF_NAME \
+        --cache-from type=registry,ref=$CI_REGISTRY_IMAGE:buildcache \
+        --cache-to type=registry,ref=$CI_REGISTRY_IMAGE:buildcache,mode=max \
+        $TAG_ARGS .
+
+# Runs the image CI just pushed and checks the two things that matter most —
+# it actually boots in HTTP mode, and the auth gate actually gates — so a
+# broken push doesn't reach dev/prod undetected. Deliberately not testing a
+# real Auth0 token here: that would need real tenant credentials in CI just
+# to prove a code path (valid-token forwarding) already covered by the unit
+# tests' logic and by manual verification against real tenants.
+test:e2e:smoke:
+  tags:
+    - our-server
+  stage: test
+  image:
+    name: "$CI_REGISTRY_IMAGE:$IMAGE_TAG"
+    entrypoint: [""]
+  services: []
+  needs:
+    - build:docker
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_IID'
+      variables: { IMAGE_TAG: "mr-$CI_MERGE_REQUEST_IID-$CI_COMMIT_SHORT_SHA" }
+    - if: '$CI_COMMIT_TAG'
+      variables: { IMAGE_TAG: "$CI_COMMIT_TAG_SLUG" }
+    - if: '$CI_COMMIT_BRANCH == "DEV"'
+      variables: { IMAGE_TAG: "dev-$CI_COMMIT_SHORT_SHA" }
+    - if: '$CI_COMMIT_BRANCH == "PROD"'
+      variables: { IMAGE_TAG: "prod-$CI_COMMIT_SHORT_SHA" }
+  variables:
+    MCP_TRANSPORT: "http"
+    MCP_HTTP_BIND_ADDR: "127.0.0.1:8080"
+    # Never dialled: the smoke test only exercises the "no/invalid token"
+    # rejection path (checked before any JWKS lookup), same reasoning as
+    # ogc-dggs-api's AUTH0_DOMAIN=https://ci.invalid in its own e2e job.
+    AUTH0_DOMAIN: "ci.invalid"
+    AUTH0_AUDIENCE: "https://ci.invalid/api"
+    OGC_DGGS_API_BASE_URL: "http://ci.invalid"
+  script:
+    # One shell invocation for the whole thing: GitLab's Docker executor runs
+    # each `script:` array item as a separate exec into the container, and a
+    # `&`-backgrounded process started in one item is not guaranteed to
+    # survive into the next (confirmed: the server logged a successful
+    # "listening" line, then the very next script item couldn't reach it at
+    # all). Starting, waiting, and asserting in one block keeps it all in one
+    # shell session.
+    - |
+      ogc-dggs-mcp > /tmp/mcp.log 2>&1 &
+      for i in $(seq 1 20); do
+        curl -fsS http://127.0.0.1:8080/healthz >/dev/null 2>&1 && break
+        [ "$i" = "20" ] && { echo "server did not come up"; cat /tmp/mcp.log; exit 1; }
+        sleep 0.5
+      done
+      test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/healthz)" = "200"
+      test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/mcp)" = "401"
+      test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer not-a-real-token' http://127.0.0.1:8080/mcp)" = "401"
+  after_script:
+    - cat /tmp/mcp.log || true
