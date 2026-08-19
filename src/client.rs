@@ -45,27 +45,35 @@ impl ApiClient {
         self.request_count.load(Ordering::Relaxed)
     }
 
-    /// GET `{base_url}{path}` with the given query pairs, attaching a bearer
-    /// token when Auth0 client-credentials are configured. Empty `path`
-    /// segments and absent query values should be filtered by the caller
-    /// before this is called.
-    pub async fn get_json(&self, path: &str, query: &[(&str, String)]) -> Result<Value, McpError> {
+    /// GET `{base_url}{path}` with the given query pairs. `caller_token`, when
+    /// set (HTTP mode), is forwarded as-is and takes priority over this
+    /// server's own Auth0 client-credentials — each customer's requests are
+    /// authenticated as them, not as one shared service identity. Empty
+    /// `path` segments and absent query values should be filtered by the
+    /// caller before this is called.
+    pub async fn get_json(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+        caller_token: Option<&str>,
+    ) -> Result<Value, McpError> {
         let url = format!("{}{}", self.base_url, path);
         let request = self.http.get(&url).query(query);
-        self.send(request, "GET", url).await
+        self.send(request, "GET", url, caller_token).await
     }
 
-    /// POST `{base_url}{path}` with a JSON body and the given query pairs,
-    /// attaching a bearer token when Auth0 client-credentials are configured.
+    /// POST `{base_url}{path}` with a JSON body and the given query pairs.
+    /// See [`Self::get_json`] for `caller_token`.
     pub async fn post_json(
         &self,
         path: &str,
         query: &[(&str, String)],
         body: &Value,
+        caller_token: Option<&str>,
     ) -> Result<Value, McpError> {
         let url = format!("{}{}", self.base_url, path);
         let request = self.http.post(&url).query(query).json(body);
-        self.send(request, "POST", url).await
+        self.send(request, "POST", url, caller_token).await
     }
 
     async fn send(
@@ -73,8 +81,11 @@ impl ApiClient {
         mut request: reqwest::RequestBuilder,
         method: &'static str,
         url: String,
+        caller_token: Option<&str>,
     ) -> Result<Value, McpError> {
-        if let Some(token_provider) = &self.token_provider {
+        if let Some(token) = caller_token {
+            request = request.header("Authorization", format!("Bearer {token}"));
+        } else if let Some(token_provider) = &self.token_provider {
             let token = token_provider.token().await.map_err(|err| {
                 McpError::internal_error(
                     format!("failed to obtain Auth0 access token: {err}"),

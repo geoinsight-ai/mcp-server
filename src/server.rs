@@ -5,7 +5,8 @@ use futures::future::join_all;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
-use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
+use rmcp::service::RequestContext;
+use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
@@ -40,6 +41,22 @@ fn enc(segment: &str) -> String {
     urlencoding::encode(segment).into_owned()
 }
 
+/// The caller's own bearer token, when this request arrived over the
+/// customer-facing HTTP transport (`src/http_transport.rs`) with a validated
+/// `Authorization` header. `None` on stdio — nothing ever inserts
+/// `http::request::Parts` into a stdio request's extensions, so this simply
+/// falls through to the server's own Auth0 client-credentials in `ApiClient`.
+/// This extraction is infallible by construction: `RequestContext<RoleServer>`
+/// and `Extensions::get` never error, they just return `None` when absent —
+/// unlike `rmcp::handler::server::tool::Extension<T>`, which *requires* `T`
+/// to be present and would break every stdio call if used here instead.
+fn caller_bearer_token(ctx: &RequestContext<RoleServer>) -> Option<String> {
+    let parts = ctx.extensions.get::<http::request::Parts>()?;
+    let header = parts.headers.get(http::header::AUTHORIZATION)?;
+    let value = header.to_str().ok()?;
+    Some(value.strip_prefix("Bearer ").unwrap_or(value).to_string())
+}
+
 #[derive(Clone)]
 pub struct DggsServer {
     client: Arc<ApiClient>,
@@ -62,12 +79,15 @@ impl DggsServer {
     /// and the DGGS resolution to sample at. Matches numeric ids directly;
     /// otherwise looks the name up (case-insensitive, exact match preferred
     /// over substring) against `GET /concepts`.
-    async fn resolve_concept(&self, insight: &str) -> Result<Value, McpError> {
+    async fn resolve_concept(&self, insight: &str, caller_token: Option<&str>) -> Result<Value, McpError> {
         if let Ok(id) = insight.parse::<u8>() {
-            return self.client.get_json(&format!("/concepts/{id}"), &[]).await;
+            return self
+                .client
+                .get_json(&format!("/concepts/{id}"), &[], caller_token)
+                .await;
         }
 
-        let concepts = self.client.get_json("/concepts", &[]).await?;
+        let concepts = self.client.get_json("/concepts", &[], caller_token).await?;
         let list = concepts
             .get("concepts")
             .and_then(Value::as_array)
@@ -119,7 +139,9 @@ impl DggsServer {
                     .get("id")
                     .and_then(Value::as_u64)
                     .ok_or_else(|| McpError::internal_error("concept is missing its id", None))?;
-                self.client.get_json(&format!("/concepts/{id}"), &[]).await
+                self.client
+                    .get_json(&format!("/concepts/{id}"), &[], caller_token)
+                    .await
             }
             many => Err(McpError::invalid_params(
                 format!(
@@ -133,9 +155,9 @@ impl DggsServer {
 
     /// The first DGGRS a collection supports, used as the default grid when
     /// the caller doesn't pin one.
-    async fn default_dggrs(&self, collection_id: &str) -> Result<String, McpError> {
+    async fn default_dggrs(&self, collection_id: &str, caller_token: Option<&str>) -> Result<String, McpError> {
         let path = format!("/collections/{}/dggs", enc(collection_id));
-        let body = self.client.get_json(&path, &[]).await?;
+        let body = self.client.get_json(&path, &[], caller_token).await?;
         let ids: Vec<&str> = body
             .get("dggrs")
             .and_then(Value::as_array)
@@ -165,6 +187,7 @@ impl DggsServer {
         dggrs_id: &str,
         bbox: &str,
         zone_level: u32,
+        caller_token: Option<&str>,
     ) -> Result<Vec<String>, McpError> {
         let path = format!(
             "/collections/{}/dggs/{}/zones",
@@ -175,7 +198,7 @@ impl DggsServer {
             ("bbox", bbox.to_string()),
             ("zone-level", zone_level.to_string()),
         ];
-        let body = self.client.get_json(&path, &query).await?;
+        let body = self.client.get_json(&path, &query, caller_token).await?;
         Ok(body
             .get("zones")
             .and_then(Value::as_array)
@@ -188,9 +211,13 @@ impl DggsServer {
 
     /// Per-property aggregation hints (`gi_dggs_stat`, `gi_unit`) for a
     /// collection, from its queryables schema.
-    async fn property_stats(&self, collection_id: &str) -> Result<HashMap<String, (Option<String>, Option<String>)>, McpError> {
+    async fn property_stats(
+        &self,
+        collection_id: &str,
+        caller_token: Option<&str>,
+    ) -> Result<HashMap<String, (Option<String>, Option<String>)>, McpError> {
         let path = format!("/collections/{}/queryables", enc(collection_id));
-        let body = self.client.get_json(&path, &[]).await?;
+        let body = self.client.get_json(&path, &[], caller_token).await?;
         let props = body
             .get("properties")
             .and_then(Value::as_object)
@@ -214,6 +241,7 @@ impl DggsServer {
         dggrs_id: &str,
         zone_id: &str,
         datetime: Option<&str>,
+        caller_token: Option<&str>,
     ) -> Result<HashMap<String, Value>, McpError> {
         let path = format!(
             "/collections/{}/dggs/{}/zones/{}/data",
@@ -225,7 +253,7 @@ impl DggsServer {
         if let Some(dt) = datetime {
             query.push(("datetime", dt.to_string()));
         }
-        let body = self.client.get_json(&path, &query).await?;
+        let body = self.client.get_json(&path, &query, caller_token).await?;
         let values = body
             .get("values")
             .and_then(Value::as_object)
@@ -259,13 +287,14 @@ impl DggsServer {
         body: &Value,
         zone_depth: Option<&str>,
         datetime: Option<&str>,
+        caller_token: Option<&str>,
     ) -> Result<Value, McpError> {
         let path = format!("/dggs/{}/zones/{}/data", enc(dggrs_id), enc(zone_id));
         let mut query = vec![("zone-depth", zone_depth.unwrap_or("0").to_string())];
         if let Some(dt) = datetime {
             query.push(("datetime", dt.to_string()));
         }
-        self.client.post_json(&path, &query, body).await
+        self.client.post_json(&path, &query, body, caller_token).await
     }
 }
 
@@ -400,16 +429,24 @@ impl DggsServer {
     #[tool(
         description = "List the insights/concepts (e.g. NDVI, burn scar analysis) this server can compute, with a short description of each. Use get_insight to actually compute one for a location."
     )]
-    async fn list_insights(&self) -> Result<String, McpError> {
-        let body = self.client.get_json("/concepts", &[]).await?;
+    async fn list_insights(&self, ctx: RequestContext<RoleServer>) -> Result<String, McpError> {
+        let caller_token = caller_bearer_token(&ctx);
+        let body = self.client.get_json("/concepts", &[], caller_token.as_deref()).await?;
         Ok(pretty(&body))
     }
 
     #[tool(
         description = "Get an insight's value for a location or area — the main data-access tool. Pass an insight (e.g. \"ndvi\", \"burn_scar_analysis\"; see list_insights) and either a point (lon/lat) or an area (min_lon/min_lat/max_lon/max_lat). This resolves the insight's data source and DGGS resolution, samples the zone(s) covering the location, and returns one aggregated value per property using that property's own configured statistic (mean, max, ...) — you get a location, not a list of DGGS zones to interpret yourself."
     )]
-    async fn get_insight(&self, Parameters(req): Parameters<GetInsightRequest>) -> Result<String, McpError> {
-        let concept = self.resolve_concept(&req.insight).await?;
+    async fn get_insight(
+        &self,
+        Parameters(req): Parameters<GetInsightRequest>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<String, McpError> {
+        let caller_token = caller_bearer_token(&ctx);
+        let caller_token = caller_token.as_deref();
+
+        let concept = self.resolve_concept(&req.insight, caller_token).await?;
         let concept_id = concept.get("id").and_then(Value::as_u64);
         let concept_name = concept
             .get("name")
@@ -453,12 +490,14 @@ impl DggsServer {
 
         let dggrs_id = match &req.dggrs_id {
             Some(d) => d.clone(),
-            None => self.default_dggrs(&collection_id).await?,
+            None => self.default_dggrs(&collection_id, caller_token).await?,
         };
 
         let bbox = build_bbox(&req.extent)?;
 
-        let mut zone_ids = self.list_zone_ids(&collection_id, &dggrs_id, &bbox, zone_level).await?;
+        let mut zone_ids = self
+            .list_zone_ids(&collection_id, &dggrs_id, &bbox, zone_level, caller_token)
+            .await?;
         if zone_ids.is_empty() {
             return Err(McpError::invalid_params(
                 format!("no zones of collection \"{collection_id}\" intersect that location at zone level {zone_level}"),
@@ -469,11 +508,11 @@ impl DggsServer {
         let zones_truncated = zones_matched > MAX_ZONES_PER_QUERY;
         zone_ids.truncate(MAX_ZONES_PER_QUERY);
 
-        let stats = self.property_stats(&collection_id).await?;
+        let stats = self.property_stats(&collection_id, caller_token).await?;
 
         let fetches = zone_ids
             .iter()
-            .map(|zone_id| self.zone_values(&collection_id, &dggrs_id, zone_id, req.datetime.as_deref()));
+            .map(|zone_id| self.zone_values(&collection_id, &dggrs_id, zone_id, req.datetime.as_deref(), caller_token));
         let results = join_all(fetches).await;
 
         // Each property is collected raw first, then reduced according to
@@ -527,7 +566,14 @@ impl DggsServer {
     #[tool(
         description = "Get raw field values from one or more collections at a location or area — the low-level counterpart to get_insight. Use this when you already know which collection(s) and field(s) you want (optionally joining several collections' fields together, e.g. elevation plus country name, in one call), rather than going through a named insight. Unlike get_insight this does not aggregate down to one number: it returns the backend's own per-zone DGGS-JSON data, one entry per sampled zone. Works without Auth0 configured."
     )]
-    async fn get_data(&self, Parameters(req): Parameters<GetDataRequest>) -> Result<String, McpError> {
+    async fn get_data(
+        &self,
+        Parameters(req): Parameters<GetDataRequest>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<String, McpError> {
+        let caller_token = caller_bearer_token(&ctx);
+        let caller_token = caller_token.as_deref();
+
         if req.collections.is_empty() {
             return Err(McpError::invalid_params(
                 "`collections` must list at least one collection",
@@ -537,7 +583,10 @@ impl DggsServer {
 
         let dggrs_id = match &req.dggrs_id {
             Some(d) => d.clone(),
-            None => self.default_dggrs(&req.collections[0].collection_id).await?,
+            None => {
+                self.default_dggrs(&req.collections[0].collection_id, caller_token)
+                    .await?
+            }
         };
         let zone_level = req.zone_level.unwrap_or(DEFAULT_ZONE_LEVEL);
         let bbox = build_bbox(&req.extent)?;
@@ -547,7 +596,7 @@ impl DggsServer {
         // requested collections can anchor the zone lookup; the first is as
         // good as any.
         let mut zone_ids = self
-            .list_zone_ids(&req.collections[0].collection_id, &dggrs_id, &bbox, zone_level)
+            .list_zone_ids(&req.collections[0].collection_id, &dggrs_id, &bbox, zone_level, caller_token)
             .await?;
         if zone_ids.is_empty() {
             return Err(McpError::invalid_params(
@@ -575,6 +624,7 @@ impl DggsServer {
                 &body,
                 req.zone_depth.as_deref(),
                 req.datetime.as_deref(),
+                caller_token,
             )
         });
         let results: Vec<Value> = join_all(fetches).await.into_iter().collect::<Result<_, _>>()?;
@@ -593,17 +643,23 @@ impl DggsServer {
     #[tool(
         description = "List the data collections available on this server (advanced/secondary — most questions are better answered with get_insight, which picks the right collection for an insight automatically)."
     )]
-    async fn list_collections(&self) -> Result<String, McpError> {
-        let body = self.client.get_json("/collections", &[]).await?;
+    async fn list_collections(&self, ctx: RequestContext<RoleServer>) -> Result<String, McpError> {
+        let caller_token = caller_bearer_token(&ctx);
+        let body = self.client.get_json("/collections", &[], caller_token.as_deref()).await?;
         Ok(pretty(&body))
     }
 
     #[tool(
         description = "Describe a single data collection: its extent, temporal range, and links (advanced/secondary — use get_insight for concept-driven queries)."
     )]
-    async fn get_collection(&self, Parameters(req): Parameters<CollectionIdRequest>) -> Result<String, McpError> {
+    async fn get_collection(
+        &self,
+        Parameters(req): Parameters<CollectionIdRequest>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<String, McpError> {
+        let caller_token = caller_bearer_token(&ctx);
         let path = format!("/collections/{}", enc(&req.collection_id));
-        let body = self.client.get_json(&path, &[]).await?;
+        let body = self.client.get_json(&path, &[], caller_token.as_deref()).await?;
         Ok(pretty(&body))
     }
 
@@ -628,11 +684,13 @@ impl ServerHandler for DggsServer {
              collection(s)/field(s) you want instead of a named insight, use get_data \
              (optionally joining fields from several collections in one call) for the raw, \
              unaggregated per-zone values. list_collections/get_collection are a secondary \
-             path for browsing raw dataset metadata. list_insights and get_insight call the \
-             bearer-token-gated /concepts route, so they need this server's Auth0 \
-             client-credentials configured; get_data, list_collections and get_collection work \
-             without it. get_call_stats reports how many backend HTTP requests this session \
-             has made in total, since a single get_insight/get_data call can fan out to many.",
+             path for browsing raw dataset metadata. In stdio mode, list_insights and \
+             get_insight need this server's own Auth0 client-credentials configured (they call \
+             the bearer-token-gated /concepts route); get_data, list_collections and \
+             get_collection work without it. In HTTP mode, every request needs its own bearer \
+             token instead, which is forwarded to ogc-dggs-api as-is. get_call_stats reports how \
+             many backend HTTP requests this session has made in total, since a single \
+             get_insight/get_data call can fan out to many.",
         )
     }
 }
