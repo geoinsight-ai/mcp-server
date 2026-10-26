@@ -1,10 +1,18 @@
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use rmcp::ErrorData as McpError;
 use serde_json::Value;
 
 use crate::auth::TokenProvider;
 use crate::config::AppConfig;
+
+/// reqwest has no timeout by default, so without these a stalled backend (or
+/// Auth0 token endpoint, which shares this client) would hang a tool call
+/// forever. The overall timeout is generous because a single zone-data
+/// request can legitimately take a while on a cold backend.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Thin HTTP client for the ogc-dggs-api. Tools build a path and a list of
 /// (already-formatted) query pairs; this client attaches auth, sends the
@@ -24,6 +32,8 @@ impl ApiClient {
     pub fn new(config: &AppConfig) -> Self {
         let http = reqwest::Client::builder()
             .user_agent(concat!("ogc-dggs-mcp/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
             .build()
             .expect("failed to build reqwest client");
 

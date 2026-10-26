@@ -46,7 +46,8 @@ pub struct AppConfig {
     /// Base URL of the ogc-dggs-api instance, e.g. `http://localhost:30001`.
     pub base_url: String,
     pub transport: Transport,
-    /// Only set (and only used) for stdio mode.
+    /// Only set (and only used) for stdio mode — always `None` in HTTP
+    /// mode, enforced in `from_env`.
     pub auth0: Option<Auth0Config>,
     /// Only set (and required) for HTTP mode.
     pub http_auth: Option<Auth0ValidationConfig>,
@@ -123,6 +124,23 @@ impl AppConfig {
                 "MCP_TRANSPORT=http requires AUTH0_DOMAIN and AUTH0_AUDIENCE to validate incoming callers"
             );
         }
+
+        // HTTP mode must never hold a service-wide identity: if it did,
+        // `ApiClient` would fall back to it for any request that somehow
+        // arrived without a caller token, silently authenticating that
+        // customer as this server. Drop it even if all four vars are set.
+        let auth0 = match transport {
+            Transport::Http { .. } => {
+                if auth0.is_some() {
+                    tracing::warn!(
+                        "AUTH0_CLIENT_ID/AUTH0_CLIENT_SECRET are ignored in HTTP mode; \
+                         only the caller's own bearer token is ever forwarded"
+                    );
+                }
+                None
+            }
+            Transport::Stdio => auth0,
+        };
 
         Self {
             base_url,
