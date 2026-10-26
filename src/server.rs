@@ -320,11 +320,15 @@ fn majority(values: &[Value]) -> Value {
             None => counts.push((v.clone(), 1)),
         }
     }
-    counts
-        .into_iter()
-        .max_by_key(|(_, count)| *count)
-        .map(|(value, _)| value)
-        .unwrap_or(Value::Null)
+    // Not `max_by_key`: it returns the *last* of equal maxima, which would
+    // break ties on the value seen last instead.
+    let mut best: Option<(Value, usize)> = None;
+    for (value, count) in counts {
+        if best.as_ref().is_none_or(|(_, best_count)| count > *best_count) {
+            best = Some((value, count));
+        }
+    }
+    best.map(|(value, _)| value).unwrap_or(Value::Null)
 }
 
 /// Extent shared by `get_insight` and `get_data`: either a point (`lon`+`lat`,
@@ -761,6 +765,17 @@ mod tests {
             Value::String("CA".to_string()),
             Value::String("CA".to_string()),
             Value::String("US".to_string()),
+        ];
+        assert_eq!(majority(&values), Value::String("CA".to_string()));
+    }
+
+    #[test]
+    fn majority_tie_breaks_on_first_seen() {
+        let values = vec![
+            Value::String("CA".to_string()),
+            Value::String("US".to_string()),
+            Value::String("US".to_string()),
+            Value::String("CA".to_string()),
         ];
         assert_eq!(majority(&values), Value::String("CA".to_string()));
     }

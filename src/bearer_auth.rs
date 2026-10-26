@@ -58,6 +58,16 @@ struct CachedJwks {
 
 const JWKS_TTL: Duration = Duration::from_secs(600);
 
+/// A token with an unknown `kid` forces a JWKS refetch (key rotation), but
+/// `kid` is attacker-controlled and checked before the signature, so without
+/// a floor any unauthenticated caller could force one Auth0 fetch per
+/// request — each holding the cache lock, stalling every other validation.
+/// Within this window of the last fetch, a forced refresh reuses the cache.
+const JWKS_MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Bounds a JWKS fetch, since it runs while holding the cache lock.
+const JWKS_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Validates a caller-supplied bearer token against Auth0's JWKS
 /// (RS256/JWKS, same mechanism ogc-dggs-api itself uses to validate tokens —
 /// see `ogc-dggs-api/src/services/auth.rs`). This is defense-in-depth and UX
@@ -85,11 +95,10 @@ impl BearerValidator {
     async fn jwks(&self, force_refresh: bool) -> Result<JwkSet, BearerAuthError> {
         let mut cache = self.jwks_cache.lock().await;
 
-        if !force_refresh {
-            if let Some(cached) = cache.as_ref() {
-                if cached.fetched_at.elapsed() < JWKS_TTL {
-                    return Ok(cached.keys.clone());
-                }
+        if let Some(cached) = cache.as_ref() {
+            let max_age = if force_refresh { JWKS_MIN_REFRESH_INTERVAL } else { JWKS_TTL };
+            if cached.fetched_at.elapsed() < max_age {
+                return Ok(cached.keys.clone());
             }
         }
 
@@ -97,6 +106,7 @@ impl BearerValidator {
         let keys = self
             .http
             .get(&url)
+            .timeout(JWKS_FETCH_TIMEOUT)
             .send()
             .await
             .map_err(|e| BearerAuthError::Unavailable(e.to_string()))?
