@@ -178,7 +178,17 @@ all logs go to stderr via `tracing`.
 - `src/auth.rs` — Auth0 client-credentials token fetch/cache
 - `src/client.rs` — thin reqwest wrapper: builds requests, attaches auth, maps HTTP
   errors to MCP tool errors
-- `src/server.rs` — the `DggsServer` tool router: 5 task-shaped `#[tool]`s, backed by
-  private helper methods (concept resolution, DGGRS/zone lookup, per-zone data fetch,
-  queryables-driven reduction) that compose several backend calls per tool
-- `src/main.rs` — wiring + stdio transport
+- `src/bearer_auth.rs` — validates an HTTP caller's Auth0 bearer token (JWKS/RS256)
+- `src/http_transport.rs` — the HTTP transport: `/mcp` behind the bearer check, `/healthz`
+- `src/server/` — the `DggsServer` tools, each next to the logic it composes:
+  - `mod.rs` — the server, its combined tool router, `get_call_stats`
+  - `insight.rs` — `list_insights`, `get_insight`: concept resolution, per-zone values,
+    per-property reduction
+  - `data.rs` — `get_data`: per-zone fetching with per-collection fallback, shaped by
+    `rows.rs` (flat rows, summary, even sampling) and `parquet.rs` (parent-zone Parquet
+    requests)
+  - `catalog.rs` — `list_collections`, `get_collection`: collection metadata and fields
+    from `/queryables`
+  - `extent.rs` — point/bbox arguments; `lookup.rs` — grid, depth and zone lookups;
+    `aggregate.rs` — `mean`/`sum`/`min`/`max`/`count` and majority vote
+- `src/main.rs` — wiring: picks the stdio or HTTP transport
