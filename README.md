@@ -178,7 +178,20 @@ all logs go to stderr via `tracing`.
 - `src/auth.rs` — Auth0 client-credentials token fetch/cache
 - `src/client.rs` — thin reqwest wrapper: builds requests, attaches auth, maps HTTP
   errors to MCP tool errors
-- `src/server.rs` — the `DggsServer` tool router: 5 task-shaped `#[tool]`s, backed by
-  private helper methods (concept resolution, DGGRS/zone lookup, per-zone data fetch,
-  queryables-driven reduction) that compose several backend calls per tool
-- `src/main.rs` — wiring + stdio transport
+- `src/bearer_auth.rs` — validates an HTTP caller's Auth0 bearer token (JWKS/RS256)
+- `src/http_transport.rs` — the HTTP transport: `/mcp` behind the bearer check, `/healthz`
+- `src/server/` — the `DggsServer` MCP server (`mod.rs`: the server and its combined tool
+  router):
+  - `tools/` — what MCP clients see, each file with the helpers only it uses:
+    - `insights.rs` — `list_insights`, `get_insight`: concept resolution, per-zone values,
+      per-property reduction
+    - `collections.rs` — `list_collections`, `get_collection`: metadata and fields from
+      `/queryables`
+    - `data/` — `get_data`: per-zone fetching with per-collection fallback (`mod.rs`),
+      flat rows, summary and sampling (`rows.rs`), parent-zone Parquet requests
+      (`parquet.rs`)
+    - `stats.rs` — `get_call_stats`
+  - `dggs/` — internal, shared by the tools: `extent.rs` (point/bbox arguments),
+    `zones.rs` (grid, depth and zone lookups), `aggregate.rs` (`mean`/`sum`/`min`/`max`/
+    `count` and majority vote)
+- `src/main.rs` — wiring: picks the stdio or HTTP transport
