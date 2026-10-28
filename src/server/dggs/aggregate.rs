@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-pub(super) fn reduce(stat: Option<&str>, values: &[f64]) -> f64 {
+pub(crate) fn reduce(stat: Option<&str>, values: &[f64]) -> f64 {
     match stat {
         Some("sum") => values.iter().sum(),
         Some("min") => values.iter().cloned().fold(f64::INFINITY, f64::min),
@@ -14,7 +14,7 @@ pub(super) fn reduce(stat: Option<&str>, values: &[f64]) -> f64 {
 /// Most frequent value across sampled zones, for non-numeric properties
 /// (e.g. `gi_dggs_stat: "majority"` on a categorical column like a country
 /// name). Ties break on whichever value was seen first.
-pub(super) fn majority(values: &[Value]) -> Value {
+pub(crate) fn majority(values: &[Value]) -> Value {
     let mut counts: Vec<(Value, usize)> = Vec::new();
     for v in values {
         match counts.iter_mut().find(|(existing, _)| existing == v) {

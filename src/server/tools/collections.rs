@@ -5,34 +5,13 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::{DggsServer, caller_bearer_token, enc, pretty};
+use crate::server::{DggsServer, caller_bearer_token, enc, pretty};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct CollectionIdRequest {
     #[schemars(description = "Collection identifier, as returned by list_collections.")]
     collection_id: String,
 }
-
-impl DggsServer {
-    /// Per-property aggregation hints (`gi_dggs_stat`, `gi_unit`) for a
-    /// collection, from its queryables schema.
-    /// A collection's queryables schema (`GET /collections/{id}/queryables`
-    /// → `properties`): its field names, types, titles and `gi_*` hints.
-    pub(super) async fn queryables(
-        &self,
-        collection_id: &str,
-        caller_token: Option<&str>,
-    ) -> Result<serde_json::Map<String, Value>, McpError> {
-        let path = format!("/collections/{}/queryables", enc(collection_id));
-        let body = self.client.get_json(&path, &[], caller_token).await?;
-        Ok(body
-            .get("properties")
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default())
-    }
-}
-
 
 /// Field names from a queryables schema, minus `zone_id` (the join key,
 /// not data). What `get_data` reads when a collection's `fields` is omitted.
@@ -60,7 +39,7 @@ fn field_summaries(props: &serde_json::Map<String, Value>) -> Vec<Value> {
         .collect()
 }
 
-#[tool_router(router = catalog_router, vis = "pub(super)")]
+#[tool_router(router = collections_router, vis = "pub(crate)")]
 impl DggsServer {
     #[tool(
         description = "List the data collections available on this server (advanced/secondary — most questions are better answered with get_insight, which picks the right collection for an insight automatically)."
@@ -94,8 +73,25 @@ impl DggsServer {
         }
         Ok(pretty(&body))
     }
-}
 
+    /// Per-property aggregation hints (`gi_dggs_stat`, `gi_unit`) for a
+    /// collection, from its queryables schema.
+    /// A collection's queryables schema (`GET /collections/{id}/queryables`
+    /// → `properties`): its field names, types, titles and `gi_*` hints.
+    pub(super) async fn queryables(
+        &self,
+        collection_id: &str,
+        caller_token: Option<&str>,
+    ) -> Result<serde_json::Map<String, Value>, McpError> {
+        let path = format!("/collections/{}/queryables", enc(collection_id));
+        let body = self.client.get_json(&path, &[], caller_token).await?;
+        Ok(body
+            .get("properties")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default())
+    }
+}
 
 #[cfg(test)]
 mod tests {

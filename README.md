@@ -180,15 +180,18 @@ all logs go to stderr via `tracing`.
   errors to MCP tool errors
 - `src/bearer_auth.rs` — validates an HTTP caller's Auth0 bearer token (JWKS/RS256)
 - `src/http_transport.rs` — the HTTP transport: `/mcp` behind the bearer check, `/healthz`
-- `src/server/` — the `DggsServer` tools, each next to the logic it composes:
-  - `mod.rs` — the server, its combined tool router, `get_call_stats`
-  - `insight.rs` — `list_insights`, `get_insight`: concept resolution, per-zone values,
-    per-property reduction
-  - `data.rs` — `get_data`: per-zone fetching with per-collection fallback, shaped by
-    `rows.rs` (flat rows, summary, even sampling) and `parquet.rs` (parent-zone Parquet
-    requests)
-  - `catalog.rs` — `list_collections`, `get_collection`: collection metadata and fields
-    from `/queryables`
-  - `extent.rs` — point/bbox arguments; `lookup.rs` — grid, depth and zone lookups;
-    `aggregate.rs` — `mean`/`sum`/`min`/`max`/`count` and majority vote
+- `src/server/` — the `DggsServer` MCP server (`mod.rs`: the server and its combined tool
+  router):
+  - `tools/` — what MCP clients see, each file with the helpers only it uses:
+    - `insights.rs` — `list_insights`, `get_insight`: concept resolution, per-zone values,
+      per-property reduction
+    - `collections.rs` — `list_collections`, `get_collection`: metadata and fields from
+      `/queryables`
+    - `data/` — `get_data`: per-zone fetching with per-collection fallback (`mod.rs`),
+      flat rows, summary and sampling (`rows.rs`), parent-zone Parquet requests
+      (`parquet.rs`)
+    - `stats.rs` — `get_call_stats`
+  - `dggs/` — internal, shared by the tools: `extent.rs` (point/bbox arguments),
+    `zones.rs` (grid, depth and zone lookups), `aggregate.rs` (`mean`/`sum`/`min`/`max`/
+    `count` and majority vote)
 - `src/main.rs` — wiring: picks the stdio or HTTP transport

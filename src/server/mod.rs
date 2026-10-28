@@ -1,31 +1,23 @@
-//! The `DggsServer` MCP tool server. Each tool lives next to the logic it
-//! composes:
+//! The `DggsServer` MCP server.
 //!
-//! - `insight`: `list_insights`, `get_insight` (concept → one aggregated value)
-//! - `data`: `get_data` (raw values for the model, Parquet requests for a map),
-//!   shaped by `rows` and `parquet`
-//! - `catalog`: `list_collections`, `get_collection` (dataset metadata and fields)
-//! - `get_call_stats`, below
-//!
-//! `extent` parses the point/bbox arguments `get_insight` and `get_data`
-//! share, `lookup` resolves grids and zones for them, and `aggregate` holds
-//! the per-property statistics.
+//! - `tools/`: what MCP clients see, one file per group of tools —
+//!   `insights` (`list_insights`, `get_insight`), `collections`
+//!   (`list_collections`, `get_collection`), `data` (`get_data`, with its
+//!   output shaping in `data/rows` and `data/parquet`), `stats`
+//!   (`get_call_stats`). Each keeps the helper methods only it uses.
+//! - `dggs/`: internal, shared by the tools — `extent` (point/bbox
+//!   arguments), `zones` (grid, depth and zone lookups), `aggregate`
+//!   (per-property statistics).
 
-mod aggregate;
-mod catalog;
-mod data;
-mod extent;
-mod insight;
-mod lookup;
-mod parquet;
-mod rows;
+mod dggs;
+mod tools;
 
 use std::sync::Arc;
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{ServerCapabilities, ServerInfo};
 use rmcp::service::RequestContext;
-use rmcp::{RoleServer, ServerHandler, tool, tool_handler, tool_router};
+use rmcp::{RoleServer, ServerHandler, tool_handler};
 use serde_json::Value;
 
 use crate::client::ApiClient;
@@ -72,26 +64,13 @@ impl DggsServer {
     pub fn new(client: ApiClient) -> Self {
         Self {
             client: Arc::new(client),
-            tool_router: Self::insight_router()
+            tool_router: Self::insights_router()
+                + Self::collections_router()
                 + Self::data_router()
-                + Self::catalog_router()
                 + Self::stats_router(),
         }
     }
 }
-
-#[tool_router(router = stats_router, vis = "pub(super)")]
-impl DggsServer {
-    #[tool(
-        description = "How many HTTP requests this server has sent to ogc-dggs-api so far this session. Useful for understanding real load: a single get_insight/get_data call can fan out to many backend requests (one per sampled zone, plus lookups), not just one."
-    )]
-    async fn get_call_stats(&self) -> String {
-        pretty(&serde_json::json!({
-            "requests_to_ogc_dggs_api": self.client.request_count(),
-        }))
-    }
-}
-
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for DggsServer {

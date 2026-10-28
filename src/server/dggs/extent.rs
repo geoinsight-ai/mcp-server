@@ -12,7 +12,7 @@ const POINT_EPSILON_DEG: f64 = 0.0005;
 /// expanded to a small bbox) or an explicit area (all four `min_*`/`max_*`
 /// fields).
 #[derive(Debug, Deserialize, JsonSchema)]
-pub(super) struct ExtentArgs {
+pub(crate) struct ExtentArgs {
     #[schemars(description = "Point longitude, WGS84 degrees. Provide together with `lat` for a point query; use the bbox fields instead for an area.")]
     lon: Option<f64>,
     #[schemars(description = "Point latitude, WGS84 degrees. Provide together with `lon`.")]
@@ -28,7 +28,7 @@ pub(super) struct ExtentArgs {
     max_lat: Option<f64>,
 }
 
-pub(super) fn build_bbox(extent: &ExtentArgs) -> Result<String, McpError> {
+pub(crate) fn build_bbox(extent: &ExtentArgs) -> Result<String, McpError> {
     match (extent.min_lon, extent.min_lat, extent.max_lon, extent.max_lat) {
         (Some(a), Some(b), Some(c), Some(d)) => Ok(format!("{a},{b},{c},{d}")),
         (None, None, None, None) => match (extent.lon, extent.lat) {
@@ -52,7 +52,7 @@ pub(super) fn build_bbox(extent: &ExtentArgs) -> Result<String, McpError> {
 }
 
 /// `Some((lon, lat))` when the extent is a point rather than a bbox.
-pub(super) fn point_of(extent: &ExtentArgs) -> Option<(f64, f64)> {
+pub(crate) fn point_of(extent: &ExtentArgs) -> Option<(f64, f64)> {
     match (extent.min_lon, extent.min_lat, extent.max_lon, extent.max_lat) {
         (None, None, None, None) => Some((extent.lon?, extent.lat?)),
         _ => None,

@@ -1,3 +1,6 @@
+mod parquet;
+mod rows;
+
 use futures::future::join_all;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::service::RequestContext;
@@ -6,11 +9,11 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::catalog::queryable_field_names;
-use super::extent::{ExtentArgs, build_bbox};
-use super::parquet::{MAX_PARQUET_REQUESTS, failed_everywhere, parent_level, parquet_request};
-use super::rows::{flatten_zone_data, sample_evenly, summarize};
-use super::{DggsServer, MAX_ZONES_PER_QUERY, caller_bearer_token, enc, pretty};
+use super::collections::queryable_field_names;
+use crate::server::dggs::extent::{ExtentArgs, build_bbox};
+use self::parquet::{MAX_PARQUET_REQUESTS, failed_everywhere, parent_level, parquet_request};
+use self::rows::{flatten_zone_data, sample_evenly, summarize};
+use crate::server::{DggsServer, MAX_ZONES_PER_QUERY, caller_bearer_token, enc, pretty};
 
 /// `get_data`'s zone level when the caller doesn't specify one. `get_insight`
 /// instead reads a concept-specific resolution, but `get_data` has no concept
@@ -52,74 +55,6 @@ struct GetDataRequest {
     datetime: Option<String>,
 }
 
-impl DggsServer {
-    /// `POST /dggs/{dggrs_id}/zones/{zone_id}/data`: fields from one or more
-    /// collections, joined on this one zone, columns named `prefix__field`.
-    /// Unlike `zone_values`, this is collection-independent by construction
-    /// (the body names its own collections) and returns the raw DGGS-JSON
-    /// body rather than a flattened map, since `get_data` doesn't reduce.
-    pub(super) async fn cross_collection_data(
-        &self,
-        dggrs_id: &str,
-        zone_id: &str,
-        body: &Value,
-        zone_depth: Option<&str>,
-        datetime: Option<&str>,
-        caller_token: Option<&str>,
-    ) -> Result<Value, McpError> {
-        let path = format!("/dggs/{}/zones/{}/data", enc(dggrs_id), enc(zone_id));
-        let mut query = vec![("zone-depth", zone_depth.unwrap_or("0").to_string())];
-        if let Some(dt) = datetime {
-            query.push(("datetime", dt.to_string()));
-        }
-        self.client.post_json(&path, &query, body, caller_token).await
-    }
-
-    /// One zone's joined row for `get_data`. A single collection with no
-    /// data at this zone fails the whole cross-collection POST (the backend
-    /// 500s with e.g. "Bbox of zones does not overlap COG extent"), which
-    /// would also throw away every other collection's values. So on failure
-    /// with several collections, retry each one alone and keep what
-    /// succeeds; only the collections that really failed are reported.
-    pub(super) async fn zone_row(
-        &self,
-        dggrs_id: &str,
-        zone_id: &str,
-        collections: &[CollectionSelectionInput],
-        zone_depth: Option<&str>,
-        datetime: Option<&str>,
-        caller_token: Option<&str>,
-    ) -> (Option<serde_json::Map<String, Value>>, Vec<Value>) {
-        let joined = self
-            .cross_collection_data(dggrs_id, zone_id, &collections_body(collections), zone_depth, datetime, caller_token)
-            .await;
-        let err = match joined {
-            Ok(body) => return (Some(flatten_zone_data(zone_id, &body)), Vec::new()),
-            Err(err) => err,
-        };
-        if collections.len() == 1 {
-            return (None, vec![zone_error(zone_id, Some(&collections[0]), &err)]);
-        }
-
-        let mut row: Option<serde_json::Map<String, Value>> = None;
-        let mut errors = Vec::new();
-        for collection in collections {
-            let body = collections_body(std::slice::from_ref(collection));
-            match self
-                .cross_collection_data(dggrs_id, zone_id, &body, zone_depth, datetime, caller_token)
-                .await
-            {
-                Ok(body) => row
-                    .get_or_insert_with(serde_json::Map::new)
-                    .extend(flatten_zone_data(zone_id, &body)),
-                Err(err) => errors.push(zone_error(zone_id, Some(collection), &err)),
-            }
-        }
-        (row, errors)
-    }
-}
-
-
 /// The cross-collection POST body for `collections`.
 pub(super) fn collections_body(collections: &[CollectionSelectionInput]) -> Value {
     serde_json::json!({
@@ -144,7 +79,7 @@ fn zone_error(zone_id: &str, collection: Option<&CollectionSelectionInput>, err:
     })
 }
 
-#[tool_router(router = data_router, vis = "pub(super)")]
+#[tool_router(router = data_router, vis = "pub(crate)")]
 impl DggsServer {
     #[tool(
         description = "Get raw field values from one or more collections at a location or area — the low-level counterpart to get_insight. Use this when you already know which collection(s) and field(s) you want (optionally joining several collections' fields together, e.g. elevation plus country name, in one call), rather than going through a named insight. Unlike get_insight this does not aggregate down to one number: for up to 20 matched zones it returns one flat row per zone (`zone_id` plus one column per field, named \"prefix__field\"); for more, a per-field `summary` (min/mean/max, or the most common values) instead. A point returns the single zone containing it. It also returns `parquet_requests`: requests (method, url, body) covering the whole area, one per parent zone, for a map to fetch and draw directly — the full data, which never needs to pass through you. Each collection's `fields` can be omitted to return all of its fields (see get_collection for what they are). If a collection has no data at a zone, the other collections' values are still returned and the failure is listed under `errors`. Works without Auth0 configured."
@@ -288,8 +223,72 @@ impl DggsServer {
         }
         Ok(pretty(&result))
     }
-}
 
+    /// `POST /dggs/{dggrs_id}/zones/{zone_id}/data`: fields from one or more
+    /// collections, joined on this one zone, columns named `prefix__field`.
+    /// Unlike `zone_values`, this is collection-independent by construction
+    /// (the body names its own collections) and returns the raw DGGS-JSON
+    /// body rather than a flattened map, since `get_data` doesn't reduce.
+    async fn cross_collection_data(
+        &self,
+        dggrs_id: &str,
+        zone_id: &str,
+        body: &Value,
+        zone_depth: Option<&str>,
+        datetime: Option<&str>,
+        caller_token: Option<&str>,
+    ) -> Result<Value, McpError> {
+        let path = format!("/dggs/{}/zones/{}/data", enc(dggrs_id), enc(zone_id));
+        let mut query = vec![("zone-depth", zone_depth.unwrap_or("0").to_string())];
+        if let Some(dt) = datetime {
+            query.push(("datetime", dt.to_string()));
+        }
+        self.client.post_json(&path, &query, body, caller_token).await
+    }
+
+    /// One zone's joined row for `get_data`. A single collection with no
+    /// data at this zone fails the whole cross-collection POST (the backend
+    /// 500s with e.g. "Bbox of zones does not overlap COG extent"), which
+    /// would also throw away every other collection's values. So on failure
+    /// with several collections, retry each one alone and keep what
+    /// succeeds; only the collections that really failed are reported.
+    async fn zone_row(
+        &self,
+        dggrs_id: &str,
+        zone_id: &str,
+        collections: &[CollectionSelectionInput],
+        zone_depth: Option<&str>,
+        datetime: Option<&str>,
+        caller_token: Option<&str>,
+    ) -> (Option<serde_json::Map<String, Value>>, Vec<Value>) {
+        let joined = self
+            .cross_collection_data(dggrs_id, zone_id, &collections_body(collections), zone_depth, datetime, caller_token)
+            .await;
+        let err = match joined {
+            Ok(body) => return (Some(flatten_zone_data(zone_id, &body)), Vec::new()),
+            Err(err) => err,
+        };
+        if collections.len() == 1 {
+            return (None, vec![zone_error(zone_id, Some(&collections[0]), &err)]);
+        }
+
+        let mut row: Option<serde_json::Map<String, Value>> = None;
+        let mut errors = Vec::new();
+        for collection in collections {
+            let body = collections_body(std::slice::from_ref(collection));
+            match self
+                .cross_collection_data(dggrs_id, zone_id, &body, zone_depth, datetime, caller_token)
+                .await
+            {
+                Ok(body) => row
+                    .get_or_insert_with(serde_json::Map::new)
+                    .extend(flatten_zone_data(zone_id, &body)),
+                Err(err) => errors.push(zone_error(zone_id, Some(collection), &err)),
+            }
+        }
+        (row, errors)
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-use super::aggregate::reduce;
+use crate::server::dggs::aggregate::reduce;
 
 /// Flattens one zone's DGGS-JSON (`values: { field: [{depth, data, shape}] }`
 /// plus links and grid metadata repeated per zone) into a single row:

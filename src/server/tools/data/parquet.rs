@@ -1,7 +1,7 @@
 use serde_json::Value;
 
-use super::data::{CollectionSelectionInput, collections_body};
-use super::enc;
+use super::{CollectionSelectionInput, collections_body};
+use crate::server::enc;
 
 /// Caps how many parent-zone Parquet requests one `get_data` call returns.
 /// Each one expands to `default_depth` levels of children (~7^6 on IVEA7H),

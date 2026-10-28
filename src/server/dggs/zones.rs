@@ -2,7 +2,7 @@ use rmcp::ErrorData as McpError;
 use serde_json::Value;
 
 use super::extent::{ExtentArgs, point_of};
-use super::{DggsServer, enc};
+use crate::server::{DggsServer, enc};
 
 /// The backend's zone-depth expansion when a grid doesn't report its own
 /// `default_depth` (IVEA7H reports 6).
@@ -15,7 +15,7 @@ const PREFERRED_DGGRS: &[&str] = &["IVEA7H"];
 impl DggsServer {
     /// The first DGGRS a collection supports, used as the default grid when
     /// the caller doesn't pin one.
-    pub(super) async fn default_dggrs(&self, collection_id: &str, caller_token: Option<&str>) -> Result<String, McpError> {
+    pub(crate) async fn default_dggrs(&self, collection_id: &str, caller_token: Option<&str>) -> Result<String, McpError> {
         let path = format!("/collections/{}/dggs", enc(collection_id));
         let body = self.client.get_json(&path, &[], caller_token).await?;
         let ids: Vec<&str> = body
@@ -43,7 +43,7 @@ impl DggsServer {
     /// How many levels the backend expands a zone by when `zone-depth` is
     /// omitted (`GET /dggs/{id}` → `default_depth`). Parquet requests omit it so the
     /// backend's cache applies; this tells us which level that lands on.
-    pub(super) async fn default_depth(&self, dggrs_id: &str, caller_token: Option<&str>) -> u32 {
+    pub(crate) async fn default_depth(&self, dggrs_id: &str, caller_token: Option<&str>) -> u32 {
         let path = format!("/dggs/{}", enc(dggrs_id));
         self.client
             .get_json(&path, &[], caller_token)
@@ -56,7 +56,7 @@ impl DggsServer {
 
     /// Zones covering the extent at `zone_level`: the one containing a point,
     /// or every zone intersecting a bbox.
-    pub(super) async fn extent_zone_ids(
+    pub(crate) async fn extent_zone_ids(
         &self,
         collection_id: &str,
         dggrs_id: &str,
@@ -75,7 +75,7 @@ impl DggsServer {
     }
 
     /// Zone ids at `zone_level` intersecting `bbox`, within a collection's grid.
-    pub(super) async fn list_zone_ids(
+    pub(crate) async fn list_zone_ids(
         &self,
         collection_id: &str,
         dggrs_id: &str,
@@ -109,7 +109,7 @@ impl DggsServer {
     /// (`f=geojson`) lets a point query answer for the zone the point is
     /// actually in. Falls back to every overlapping zone if none contains it
     /// (a point exactly on a shared edge).
-    pub(super) async fn point_zone_ids(
+    pub(crate) async fn point_zone_ids(
         &self,
         collection_id: &str,
         dggrs_id: &str,
@@ -147,7 +147,6 @@ impl DggsServer {
         })
     }
 }
-
 
 /// Ray-casting point-in-polygon test against a GeoJSON linear ring
 /// (`[[lon, lat], ...]`). Ignores antimeridian wrap, which no zone this
