@@ -19,7 +19,7 @@ routes are deliberately **not** exposed as tools at all.
 | `get_insight` | The main tool: one aggregated value of an insight at a point or over an area | `GET /concepts/{id}`, `GET /collections/{id}/dggs`, `GET .../zones`, `GET .../zones/{id}/data` (×N, concurrently), `GET /collections/{id}/queryables` |
 | `get_data` | Raw, unaggregated field values from one or more named collections at a location, optionally joined in one call | `GET /collections/{id}/dggs`, `GET .../zones`, `POST /dggs/{id}/zones/{id}/data` (×N, concurrently) |
 | `list_collections` | Browse raw dataset metadata directly (secondary/advanced) | `GET /collections` |
-| `get_collection` | Describe one dataset directly (secondary/advanced) | `GET /collections/{id}` |
+| `get_collection` | Describe one dataset, including its `fields` (name, type, title, unit, aggregation stat) | `GET /collections/{id}`, `GET /collections/{id}/queryables` |
 
 `list_insights` and `get_insight` need this server's Auth0 client-credentials configured
 — they call `/concepts`, the one route the backend guards with a bearer token.
@@ -50,24 +50,42 @@ The result is one JSON object: the insight, which collection/grid/resolution wer
 how many zones were sampled, and a `values` map of `{ value, stat, unit, sampled_zones }`
 per property.
 
-### `get_data`: raw values, your choice of collection(s)
+### `get_data`: raw values for the model, Parquet requests for the map
 
 `get_insight` is concept-first and aggregated; `get_data` is the lower-level sibling for
-when you already know the collection(s)/field(s) you want and want the actual per-zone
-values, not a single reduced number. Given a location and a `collections` array (each
-`{ collection_id, fields, alias?, filter? }`, mirroring the backend's cross-collection
-body), it:
+when you already know the collection(s)/field(s) you want. Given a location and a
+`collections` array (each `{ collection_id, fields?, alias?, filter? }`, mirroring the
+backend's cross-collection body; leave `fields` out to get every field in the collection's
+`/queryables` schema), it returns two things: a **small answer** for the
+model, and **Parquet requests** a map fetches and draws itself, so the full data never
+passes through the model or this server.
 
 1. Picks a DGGRS grid (first listed collection's `GET .../dggs`, preferring `IVEA7H`
    when available — see gotcha below — unless overridden).
-2. Resolves the location to zone(s) at `zone_level` (default 9), same as `get_insight`.
-3. `POST`s `/dggs/{dggrs_id}/zones/{zone_id}/data` once per zone (capped at 64,
-   concurrent), with the `collections` array as the body. Fields from different
-   collections come back joined on the same zone, as `prefix__field` columns
-   (`prefix` = `alias` or `collection_id`) — this is how you pull e.g. elevation and a
-   country name together in one call instead of two separate lookups.
-4. Returns the backend's own DGGS-JSON per sampled zone, unmodified — no aggregation,
-   by design.
+2. Takes the **children level** from `zone_level` (default 9; to be derived from each
+   collection's resolution once collections record one) and the **parent level** from it:
+   children level minus the grid's `default_depth` (`GET /dggs/{id}`, 6 on IVEA7H).
+3. Resolves the location at the children level. A point resolves to the **single zone
+   containing it** (zone polygons via `f=geojson`, point-in-polygon), not the 2-3
+   neighbours its small search box overlaps; an area to every zone it intersects.
+4. **Small answer:**
+   - 20 matched zones or fewer → `rows`: one flat row per zone,
+     `{ zone_id, prefix__field: value, ... }` (`prefix` = `alias` or `collection_id`),
+     from `POST /dggs/{dggrs_id}/zones/{zone_id}/data` per zone.
+   - More → `summary`: per field, min/mean/max for numbers or the most common values
+     otherwise, computed over up to 64 zones sampled evenly across the area
+     (`summary_sampled_zones`).
+5. **`parquet_requests`:** one Parquet request per parent zone covering the location (up to 16;
+   `requests_truncated` beyond that), each `{ parent_zone_id, method, url, body? }`. One
+   collection with no alias/filter → the per-collection `GET .../zones/{parent}/data`;
+   otherwise the cross-collection `POST`, so several collections come back as one
+   combined view. `zone-depth` is omitted so the backend expands each parent by its
+   default depth (and can serve it from its cache) — about 118,000 children per parent on
+   IVEA7H.
+6. If a collection fails at a zone, the zone is retried one collection at a time so the
+   others' values still come back; each failure is listed under `errors` with the
+   backend's `hint`. A collection that fails at **every** sampled zone is left out of the
+   Parquet requests (`excluded_collections`). Only if no zone returns anything is the call an error.
 
 `zone_depth` (default `"0"`, one value per zone) passes straight through to the
 backend's own zone-depth expansion if you want finer detail *within* a resolved zone;
