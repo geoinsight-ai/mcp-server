@@ -50,6 +50,12 @@ impl ApiClient {
         }
     }
 
+    /// Base URL of the ogc-dggs-api instance, e.g. for building links the
+    /// caller fetches itself (see `get_data`'s `parquet_requests`).
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     /// Requests sent to ogc-dggs-api so far this process.
     pub fn request_count(&self) -> u64 {
         self.request_count.load(Ordering::Relaxed)

@@ -29,6 +29,20 @@ const MAX_ZONES_PER_QUERY: usize = 64;
 /// to read it from.
 const DEFAULT_ZONE_LEVEL: u32 = 9;
 
+/// `get_data` returns one row per zone up to this many matched zones; above
+/// it, a per-field summary instead, so the model's context stays small.
+const MAX_ROWS: usize = 20;
+
+/// The backend's zone-depth expansion when a grid doesn't report its own
+/// `default_depth` (IVEA7H reports 6).
+const FALLBACK_DEFAULT_DEPTH: u32 = 6;
+
+/// Caps how many parent-zone Parquet requests one `get_data` call returns.
+/// Each one expands to `default_depth` levels of children (~7^6 on IVEA7H),
+/// so this bounds what the map is asked to load. Provisional until we know
+/// what the map draws comfortably.
+const MAX_PARQUET_REQUESTS: usize = 16;
+
 /// DGGRS ids to prefer, in order, when a collection supports several and the
 /// caller didn't pin one. See `default_dggrs`.
 const PREFERRED_DGGRS: &[&str] = &["IVEA7H"];
@@ -180,6 +194,40 @@ impl DggsServer {
             })
     }
 
+    /// How many levels the backend expands a zone by when `zone-depth` is
+    /// omitted (`GET /dggs/{id}` → `default_depth`). Parquet requests omit it so the
+    /// backend's cache applies; this tells us which level that lands on.
+    async fn default_depth(&self, dggrs_id: &str, caller_token: Option<&str>) -> u32 {
+        let path = format!("/dggs/{}", enc(dggrs_id));
+        self.client
+            .get_json(&path, &[], caller_token)
+            .await
+            .ok()
+            .and_then(|body| body.get("default_depth").and_then(Value::as_u64))
+            .map(|d| d as u32)
+            .unwrap_or(FALLBACK_DEFAULT_DEPTH)
+    }
+
+    /// Zones covering the extent at `zone_level`: the one containing a point,
+    /// or every zone intersecting a bbox.
+    async fn extent_zone_ids(
+        &self,
+        collection_id: &str,
+        dggrs_id: &str,
+        extent: &ExtentArgs,
+        bbox: &str,
+        zone_level: u32,
+        caller_token: Option<&str>,
+    ) -> Result<Vec<String>, McpError> {
+        match point_of(extent) {
+            Some(point) => {
+                self.point_zone_ids(collection_id, dggrs_id, bbox, zone_level, point, caller_token)
+                    .await
+            }
+            None => self.list_zone_ids(collection_id, dggrs_id, bbox, zone_level, caller_token).await,
+        }
+    }
+
     /// Zone ids at `zone_level` intersecting `bbox`, within a collection's grid.
     async fn list_zone_ids(
         &self,
@@ -209,8 +257,68 @@ impl DggsServer {
             .collect())
     }
 
+    /// The one zone at `zone_level` whose polygon contains (`lon`, `lat`).
+    /// `list_zone_ids` on a point's epsilon box typically returns the 2-3
+    /// neighbouring zones that box overlaps; asking for their polygons
+    /// (`f=geojson`) lets a point query answer for the zone the point is
+    /// actually in. Falls back to every overlapping zone if none contains it
+    /// (a point exactly on a shared edge).
+    async fn point_zone_ids(
+        &self,
+        collection_id: &str,
+        dggrs_id: &str,
+        bbox: &str,
+        zone_level: u32,
+        (lon, lat): (f64, f64),
+        caller_token: Option<&str>,
+    ) -> Result<Vec<String>, McpError> {
+        let path = format!(
+            "/collections/{}/dggs/{}/zones",
+            enc(collection_id),
+            enc(dggrs_id)
+        );
+        let query = vec![
+            ("bbox", bbox.to_string()),
+            ("zone-level", zone_level.to_string()),
+            ("f", "geojson".to_string()),
+        ];
+        let body = self.client.get_json(&path, &query, caller_token).await?;
+        let features = body
+            .get("features")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        let id_of = |f: &Value| f.get("id").and_then(Value::as_str).map(str::to_string);
+        let containing = features.iter().find(|f| {
+            f.pointer("/geometry/coordinates/0")
+                .and_then(Value::as_array)
+                .is_some_and(|ring| ring_contains(ring, lon, lat))
+        });
+        Ok(match containing.and_then(id_of) {
+            Some(id) => vec![id],
+            None => features.iter().filter_map(id_of).collect(),
+        })
+    }
+
     /// Per-property aggregation hints (`gi_dggs_stat`, `gi_unit`) for a
     /// collection, from its queryables schema.
+    /// A collection's queryables schema (`GET /collections/{id}/queryables`
+    /// → `properties`): its field names, types, titles and `gi_*` hints.
+    async fn queryables(
+        &self,
+        collection_id: &str,
+        caller_token: Option<&str>,
+    ) -> Result<serde_json::Map<String, Value>, McpError> {
+        let path = format!("/collections/{}/queryables", enc(collection_id));
+        let body = self.client.get_json(&path, &[], caller_token).await?;
+        Ok(body
+            .get("properties")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default())
+    }
+
     async fn property_stats(
         &self,
         collection_id: &str,
@@ -296,6 +404,292 @@ impl DggsServer {
         }
         self.client.post_json(&path, &query, body, caller_token).await
     }
+
+    /// One zone's joined row for `get_data`. A single collection with no
+    /// data at this zone fails the whole cross-collection POST (the backend
+    /// 500s with e.g. "Bbox of zones does not overlap COG extent"), which
+    /// would also throw away every other collection's values. So on failure
+    /// with several collections, retry each one alone and keep what
+    /// succeeds; only the collections that really failed are reported.
+    async fn zone_row(
+        &self,
+        dggrs_id: &str,
+        zone_id: &str,
+        collections: &[CollectionSelectionInput],
+        zone_depth: Option<&str>,
+        datetime: Option<&str>,
+        caller_token: Option<&str>,
+    ) -> (Option<serde_json::Map<String, Value>>, Vec<Value>) {
+        let joined = self
+            .cross_collection_data(dggrs_id, zone_id, &collections_body(collections), zone_depth, datetime, caller_token)
+            .await;
+        let err = match joined {
+            Ok(body) => return (Some(flatten_zone_data(zone_id, &body)), Vec::new()),
+            Err(err) => err,
+        };
+        if collections.len() == 1 {
+            return (None, vec![zone_error(zone_id, Some(&collections[0]), &err)]);
+        }
+
+        let mut row: Option<serde_json::Map<String, Value>> = None;
+        let mut errors = Vec::new();
+        for collection in collections {
+            let body = collections_body(std::slice::from_ref(collection));
+            match self
+                .cross_collection_data(dggrs_id, zone_id, &body, zone_depth, datetime, caller_token)
+                .await
+            {
+                Ok(body) => row
+                    .get_or_insert_with(serde_json::Map::new)
+                    .extend(flatten_zone_data(zone_id, &body)),
+                Err(err) => errors.push(zone_error(zone_id, Some(collection), &err)),
+            }
+        }
+        (row, errors)
+    }
+}
+
+/// Field names from a queryables schema, minus `zone_id` (the join key,
+/// not data). What `get_data` reads when a collection's `fields` is omitted.
+fn queryable_field_names(props: &serde_json::Map<String, Value>) -> Vec<String> {
+    props.keys().filter(|name| *name != "zone_id").cloned().collect()
+}
+
+/// A queryables schema as a compact field list for `get_collection`: what
+/// each field is and how it aggregates across zones, so the model can pick
+/// fields and explain values (e.g. "Total Parcel Area", summed).
+fn field_summaries(props: &serde_json::Map<String, Value>) -> Vec<Value> {
+    props
+        .iter()
+        .filter(|(name, _)| *name != "zone_id")
+        .map(|(name, schema)| {
+            let mut field = serde_json::Map::new();
+            field.insert("name".to_string(), Value::String(name.clone()));
+            for (key, out) in [("type", "type"), ("title", "title"), ("gi_dggs_stat", "stat"), ("gi_unit", "unit")] {
+                if let Some(v) = schema.get(key).filter(|v| !v.is_null()) {
+                    field.insert(out.to_string(), v.clone());
+                }
+            }
+            Value::Object(field)
+        })
+        .collect()
+}
+
+/// The cross-collection POST body for `collections`.
+fn collections_body(collections: &[CollectionSelectionInput]) -> Value {
+    serde_json::json!({
+        "collections": collections.iter().map(|c| serde_json::json!({
+            "id": c.collection_id,
+            "fields": c.fields,
+            "alias": c.alias,
+            "filter": c.filter,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// A failed zone/collection fetch, reported alongside the rows that did
+/// succeed. Carries the backend's own `hint` when it gave one.
+fn zone_error(zone_id: &str, collection: Option<&CollectionSelectionInput>, err: &McpError) -> Value {
+    let hint = err.data.as_ref().and_then(|d| d.get("hint")).cloned();
+    serde_json::json!({
+        "zone_id": zone_id,
+        "collection_id": collection.map(|c| &c.collection_id),
+        "message": err.message,
+        "hint": hint,
+    })
+}
+
+/// Flattens one zone's DGGS-JSON (`values: { field: [{depth, data, shape}] }`
+/// plus links and grid metadata repeated per zone) into a single row:
+/// `{zone_id, field: value}` at one depth with one value, `field: [values]`
+/// for one depth expanded into sub-zones, `field: {depth: [values]}` for
+/// several depths. Most of the original bytes were wrapper, not data.
+fn flatten_zone_data(zone_id: &str, body: &Value) -> serde_json::Map<String, Value> {
+    let mut row = serde_json::Map::new();
+    let id = body.get("zoneId").and_then(Value::as_str).unwrap_or(zone_id);
+    row.insert("zone_id".to_string(), Value::String(id.to_string()));
+
+    let Some(values) = body.get("values").and_then(Value::as_object) else {
+        return row;
+    };
+    for (field, depths) in values {
+        let depths = depths.as_array().map(Vec::as_slice).unwrap_or_default();
+        let data_of = |d: &Value| d.get("data").cloned().unwrap_or(Value::Null);
+        let value = match depths {
+            [single] => match data_of(single) {
+                Value::Array(mut data) if data.len() == 1 => data.remove(0),
+                data => data,
+            },
+            many => Value::Object(
+                many.iter()
+                    .map(|d| {
+                        let depth = d.get("depth").map(Value::to_string).unwrap_or_default();
+                        (depth, data_of(d))
+                    })
+                    .collect(),
+            ),
+        };
+        row.insert(field.clone(), value);
+    }
+    row
+}
+
+/// Parent level for the Parquet requests, and the `zone-depth` to send with
+/// them. A request omits `zone-depth` so the backend expands its parent by
+/// `default_depth` (and can serve it from cache); that only reaches
+/// `children_level` when the parent sits `default_depth` levels above it.
+/// For a children level shallower than that, the parent is level 0 and the
+/// depth is sent explicitly.
+fn parent_level(children_level: u32, default_depth: u32) -> (u32, Option<u32>) {
+    if children_level >= default_depth {
+        (children_level - default_depth, None)
+    } else {
+        (0, Some(children_level))
+    }
+}
+
+/// One Parquet request covering `parent_zone_id`, for the
+/// caller to fetch itself. A single collection with no alias/filter uses the
+/// plain per-collection GET (which also accepts ids the cross-collection
+/// endpoint rejects, like `sentinel-2-l2a`); otherwise the cross-collection
+/// POST, so several collections come back as one combined view.
+fn parquet_request(
+    base_url: &str,
+    dggrs_id: &str,
+    parent_zone_id: &str,
+    collections: &[CollectionSelectionInput],
+    datetime: Option<&str>,
+    zone_depth: Option<u32>,
+) -> Value {
+    let mut query = vec!["f=parquet".to_string()];
+    if let Some(dt) = datetime {
+        query.push(format!("datetime={}", enc(dt)));
+    }
+    if let Some(depth) = zone_depth {
+        query.push(format!("zone-depth={depth}"));
+    }
+    let query = query.join("&");
+
+    match collections {
+        [only] if only.alias.is_none() && only.filter.is_none() => serde_json::json!({
+            "parent_zone_id": parent_zone_id,
+            "method": "GET",
+            "url": format!(
+                "{base_url}/collections/{}/dggs/{}/zones/{}/data?{query}",
+                enc(&only.collection_id),
+                enc(dggrs_id),
+                enc(parent_zone_id)
+            ),
+        }),
+        _ => serde_json::json!({
+            "parent_zone_id": parent_zone_id,
+            "method": "POST",
+            "url": format!("{base_url}/dggs/{}/zones/{}/data?{query}", enc(dggrs_id), enc(parent_zone_id)),
+            "body": collections_body(collections),
+        }),
+    }
+}
+
+/// Collections that failed at every one of `sampled` zones (e.g. a Canadian
+/// DEM queried in Portugal, if the backend 500s rather than returning
+/// nulls). Every combined Parquet request would fail the same way, so these
+/// are left out of the Parquet requests and named instead.
+fn failed_everywhere(collections: &[CollectionSelectionInput], errors: &[Value], sampled: usize) -> Vec<String> {
+    collections
+        .iter()
+        .filter(|c| {
+            let failures = errors
+                .iter()
+                .filter(|e| e["collection_id"].as_str() == Some(c.collection_id.as_str()))
+                .count();
+            failures == sampled
+        })
+        .map(|c| c.collection_id.clone())
+        .collect()
+}
+
+/// Per-field summary across rows, for when there are too many zones to
+/// return as rows: min/mean/max for numeric fields, the most common values
+/// for anything else. Sub-zone arrays (`zone_depth` > 0) count each element.
+fn summarize(rows: &[Value]) -> serde_json::Map<String, Value> {
+    let mut samples: Vec<(String, Vec<Value>)> = Vec::new();
+    for row in rows.iter().filter_map(Value::as_object) {
+        for (field, value) in row.iter().filter(|(field, _)| *field != "zone_id") {
+            let values = match value {
+                Value::Array(items) => items.clone(),
+                other => vec![other.clone()],
+            };
+            let values = values.into_iter().filter(|v| !v.is_null());
+            match samples.iter_mut().find(|(name, _)| name == field) {
+                Some((_, existing)) => existing.extend(values),
+                None => samples.push((field.clone(), values.collect())),
+            }
+        }
+    }
+
+    samples
+        .into_iter()
+        .map(|(field, values)| {
+            let nums: Option<Vec<f64>> = values.iter().map(Value::as_f64).collect();
+            let summary = match nums {
+                Some(nums) if !nums.is_empty() => serde_json::json!({
+                    "min": reduce(Some("min"), &nums),
+                    "mean": reduce(Some("mean"), &nums),
+                    "max": reduce(Some("max"), &nums),
+                    "count": nums.len(),
+                }),
+                _ => {
+                    let mut counts: Vec<(Value, usize)> = Vec::new();
+                    for v in &values {
+                        match counts.iter_mut().find(|(existing, _)| existing == v) {
+                            Some((_, count)) => *count += 1,
+                            None => counts.push((v.clone(), 1)),
+                        }
+                    }
+                    let distinct = counts.len();
+                    // Stable sort: ties keep first-seen order, like `majority`.
+                    counts.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+                    serde_json::json!({
+                        "top": counts.into_iter().take(5)
+                            .map(|(value, count)| serde_json::json!({ "value": value, "count": count }))
+                            .collect::<Vec<_>>(),
+                        "distinct": distinct,
+                        "count": values.len(),
+                    })
+                }
+            };
+            (field, summary)
+        })
+        .collect()
+}
+
+/// Ray-casting point-in-polygon test against a GeoJSON linear ring
+/// (`[[lon, lat], ...]`). Ignores antimeridian wrap, which no zone this
+/// server samples at a point query's resolution straddles in practice.
+fn ring_contains(ring: &[Value], lon: f64, lat: f64) -> bool {
+    let points: Vec<(f64, f64)> = ring
+        .iter()
+        .filter_map(|p| Some((p.get(0)?.as_f64()?, p.get(1)?.as_f64()?)))
+        .collect();
+    let mut inside = false;
+    for (i, &(xi, yi)) in points.iter().enumerate() {
+        let (xj, yj) = points[(i + points.len() - 1) % points.len()];
+        if (yi > lat) != (yj > lat) && lon < (xj - xi) * (lat - yi) / (yj - yi) + xi {
+            inside = !inside;
+        }
+    }
+    inside
+}
+
+/// Up to `max` ids spread evenly across `ids`, instead of the first `max`.
+/// The backend lists zones in id order, which is spatially clustered, so
+/// truncating to the head of the list samples one corner of the area.
+fn sample_evenly(ids: Vec<String>, max: usize) -> Vec<String> {
+    if ids.len() <= max {
+        return ids;
+    }
+    let step = ids.len() as f64 / max as f64;
+    (0..max).map(|i| ids[(i as f64 * step) as usize].clone()).collect()
 }
 
 fn reduce(stat: Option<&str>, values: &[f64]) -> f64 {
@@ -374,6 +768,14 @@ fn build_bbox(extent: &ExtentArgs) -> Result<String, McpError> {
     }
 }
 
+/// `Some((lon, lat))` when the extent is a point rather than a bbox.
+fn point_of(extent: &ExtentArgs) -> Option<(f64, f64)> {
+    match (extent.min_lon, extent.min_lat, extent.max_lon, extent.max_lat) {
+        (None, None, None, None) => Some((extent.lon?, extent.lat?)),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 struct GetInsightRequest {
     #[schemars(description = "Which insight/concept to compute, e.g. \"ndvi\", \"burn_scar_analysis\". Matches by numeric id or by name/label (case-insensitive). See list_insights for what's available.")]
@@ -402,7 +804,8 @@ struct CollectionIdRequest {
 struct CollectionSelectionInput {
     #[schemars(description = "Collection id to read from, as returned by list_collections.")]
     collection_id: String,
-    #[schemars(description = "Fields to return from this collection's schema (see get_collection, or its queryables link). Required, non-empty — there is no wildcard.")]
+    #[schemars(description = "Fields to return from this collection, as listed under `fields` by get_collection. Omit to return every field of the collection.")]
+    #[serde(default)]
     fields: Vec<String>,
     #[schemars(description = "Rename this collection's output column prefix (columns come back named \"prefix__field\"). Needed to select the same collection twice under different filters.")]
     alias: Option<String>,
@@ -420,7 +823,7 @@ struct GetDataRequest {
 
     #[schemars(description = "DGGRS grid to compute on. Omit to use the first listed collection's default grid.")]
     dggrs_id: Option<String>,
-    #[schemars(description = "DGGS zone level (resolution) to resolve the location to. Defaults to 9 if omitted; override for coarser/finer sampling.")]
+    #[schemars(description = "DGGS zone level (resolution) of the data: rows and summary are at this level, and the Parquet requests expand to it from parent zones the grid's default depth above. Defaults to 9 if omitted; override for coarser/finer data.")]
     zone_level: Option<u32>,
     #[schemars(description = "Relative depth(s) below the resolved zone to expand into, for finer-than-zone_level detail within it: a single value \"5\", a range \"1-8\", or a list \"1,3,7\". Omit for one value per zone (zone-depth=0) — this can return a lot of data if set too deep.")]
     zone_depth: Option<String>,
@@ -568,7 +971,7 @@ impl DggsServer {
     }
 
     #[tool(
-        description = "Get raw field values from one or more collections at a location or area — the low-level counterpart to get_insight. Use this when you already know which collection(s) and field(s) you want (optionally joining several collections' fields together, e.g. elevation plus country name, in one call), rather than going through a named insight. Unlike get_insight this does not aggregate down to one number: it returns the backend's own per-zone DGGS-JSON data, one entry per sampled zone. Works without Auth0 configured."
+        description = "Get raw field values from one or more collections at a location or area — the low-level counterpart to get_insight. Use this when you already know which collection(s) and field(s) you want (optionally joining several collections' fields together, e.g. elevation plus country name, in one call), rather than going through a named insight. Unlike get_insight this does not aggregate down to one number: for up to 20 matched zones it returns one flat row per zone (`zone_id` plus one column per field, named \"prefix__field\"); for more, a per-field `summary` (min/mean/max, or the most common values) instead. A point returns the single zone containing it. It also returns `parquet_requests`: requests (method, url, body) covering the whole area, one per parent zone, for a map to fetch and draw directly — the full data, which never needs to pass through you. Each collection's `fields` can be omitted to return all of its fields (see get_collection for what they are). If a collection has no data at a zone, the other collections' values are still returned and the failure is listed under `errors`. Works without Auth0 configured."
     )]
     async fn get_data(
         &self,
@@ -585,62 +988,128 @@ impl DggsServer {
             ));
         }
 
+        // The backend has no "all fields" wildcard, so a collection with no
+        // `fields` gets every field in its queryables schema, as explore's
+        // own data view does.
+        let mut collections = req.collections.clone();
+        for c in collections.iter_mut().filter(|c| c.fields.is_empty()) {
+            c.fields = queryable_field_names(&self.queryables(&c.collection_id, caller_token).await?);
+            if c.fields.is_empty() {
+                return Err(McpError::invalid_params(
+                    format!("collection \"{}\" has no queryable fields", c.collection_id),
+                    None,
+                ));
+            }
+        }
+
         let dggrs_id = match &req.dggrs_id {
             Some(d) => d.clone(),
             None => {
-                self.default_dggrs(&req.collections[0].collection_id, caller_token)
+                self.default_dggrs(&collections[0].collection_id, caller_token)
                     .await?
             }
         };
-        let zone_level = req.zone_level.unwrap_or(DEFAULT_ZONE_LEVEL);
+        // TODO: derive from each collection's resolution once collections
+        // record one (`gi_resolution_m`); until then, the caller's level or 9.
+        let children_level = req.zone_level.unwrap_or(DEFAULT_ZONE_LEVEL);
         let bbox = build_bbox(&req.extent)?;
 
-        // DGGS child zones are collection-independent (they depend only on
-        // the DGGRS, the parent zone and the depth), so any one of the
-        // requested collections can anchor the zone lookup; the first is as
-        // good as any.
-        let mut zone_ids = self
-            .list_zone_ids(&req.collections[0].collection_id, &dggrs_id, &bbox, zone_level, caller_token)
-            .await?;
+        // DGGS zones are collection-independent (they depend only on the
+        // DGGRS, the level and the extent), so any one of the requested
+        // collections can anchor the zone lookups; the first is as good as
+        // any.
+        let anchor = &collections[0].collection_id;
+        let (zone_ids, default_depth) = futures::join!(
+            self.extent_zone_ids(anchor, &dggrs_id, &req.extent, &bbox, children_level, caller_token),
+            self.default_depth(&dggrs_id, caller_token),
+        );
+        let zone_ids = zone_ids?;
         if zone_ids.is_empty() {
             return Err(McpError::invalid_params(
-                format!("no zones intersect that location at zone level {zone_level}"),
+                format!("no zones intersect that location at zone level {children_level}"),
                 None,
             ));
         }
         let zones_matched = zone_ids.len();
-        let zones_truncated = zones_matched > MAX_ZONES_PER_QUERY;
-        zone_ids.truncate(MAX_ZONES_PER_QUERY);
+        let as_rows = zones_matched <= MAX_ROWS;
+        let zone_ids = sample_evenly(zone_ids, MAX_ZONES_PER_QUERY);
 
-        let body = serde_json::json!({
-            "collections": req.collections.iter().map(|c| serde_json::json!({
-                "id": c.collection_id,
-                "fields": c.fields,
-                "alias": c.alias,
-                "filter": c.filter,
-            })).collect::<Vec<_>>(),
-        });
+        let (parent_level, request_depth) = parent_level(children_level, default_depth);
+        let parent_ids = self.extent_zone_ids(anchor, &dggrs_id, &req.extent, &bbox, parent_level, caller_token);
 
-        let fetches = zone_ids.iter().map(|zone_id| {
-            self.cross_collection_data(
+        let fetches = join_all(zone_ids.iter().map(|zone_id| {
+            self.zone_row(
                 &dggrs_id,
                 zone_id,
-                &body,
+                &collections,
                 req.zone_depth.as_deref(),
                 req.datetime.as_deref(),
                 caller_token,
             )
-        });
-        let results: Vec<Value> = join_all(fetches).await.into_iter().collect::<Result<_, _>>()?;
+        }));
+        let (fetched, parent_ids) = futures::join!(fetches, parent_ids);
+        let parent_ids = parent_ids?;
 
-        let result = serde_json::json!({
+        let mut rows = Vec::new();
+        let mut errors = Vec::new();
+        for (row, zone_errors) in fetched {
+            rows.extend(row.map(Value::Object));
+            errors.extend(zone_errors);
+        }
+
+        if rows.is_empty() {
+            return Err(McpError::invalid_params(
+                "no data for any sampled zone; see `errors` for each failure",
+                Some(serde_json::json!({ "errors": errors })),
+            ));
+        }
+
+        let excluded = failed_everywhere(&collections, &errors, zone_ids.len());
+        let request_collections: Vec<CollectionSelectionInput> = collections
+            .iter()
+            .filter(|c| !excluded.contains(&c.collection_id))
+            .cloned()
+            .collect();
+
+        let requests_truncated = parent_ids.len() > MAX_PARQUET_REQUESTS;
+        let parquet_requests: Vec<Value> = parent_ids
+            .iter()
+            .take(MAX_PARQUET_REQUESTS)
+            .map(|parent| {
+                parquet_request(
+                    self.client.base_url(),
+                    &dggrs_id,
+                    parent,
+                    &request_collections,
+                    req.datetime.as_deref(),
+                    request_depth,
+                )
+            })
+            .collect();
+
+        let mut result = serde_json::json!({
             "dggrs_id": dggrs_id,
-            "zone_level": zone_level,
-            "zones_sampled": results.len(),
+            "children_level": children_level,
+            "parent_level": parent_level,
             "zones_matched": zones_matched,
-            "zones_truncated": zones_truncated,
-            "results": results,
         });
+        if as_rows {
+            result["rows"] = Value::Array(rows);
+        } else {
+            result["summary"] = Value::Object(summarize(&rows));
+            result["summary_sampled_zones"] = serde_json::json!(rows.len());
+        }
+        result["parquet_requests"] = Value::Array(parquet_requests);
+        if !excluded.is_empty() {
+            result["excluded_collections"] = serde_json::json!(excluded);
+        }
+        if requests_truncated {
+            result["requests_truncated"] = Value::Bool(true);
+            result["parent_zones_matched"] = serde_json::json!(parent_ids.len());
+        }
+        if !errors.is_empty() {
+            result["errors"] = Value::Array(errors);
+        }
         Ok(pretty(&result))
     }
 
@@ -654,7 +1123,7 @@ impl DggsServer {
     }
 
     #[tool(
-        description = "Describe a single data collection: its extent, temporal range, and links (advanced/secondary — use get_insight for concept-driven queries)."
+        description = "Describe a single data collection: its extent, temporal range, links, and `fields` — each field's name, type, title, unit and how it aggregates across zones (`stat`). Use the field names with get_data, or omit them there to get every field."
     )]
     async fn get_collection(
         &self,
@@ -662,8 +1131,18 @@ impl DggsServer {
         ctx: RequestContext<RoleServer>,
     ) -> Result<String, McpError> {
         let caller_token = caller_bearer_token(&ctx);
+        let caller_token = caller_token.as_deref();
         let path = format!("/collections/{}", enc(&req.collection_id));
-        let body = self.client.get_json(&path, &[], caller_token.as_deref()).await?;
+        let (collection, queryables) = futures::join!(
+            self.client.get_json(&path, &[], caller_token),
+            self.queryables(&req.collection_id, caller_token),
+        );
+        let mut body = collection?;
+        // The fields are an addition: a collection whose queryables fail to
+        // load is still described.
+        if let Ok(props) = queryables {
+            body["fields"] = Value::Array(field_summaries(&props));
+        }
         Ok(pretty(&body))
     }
 
@@ -778,6 +1257,151 @@ mod tests {
             Value::String("CA".to_string()),
         ];
         assert_eq!(majority(&values), Value::String("CA".to_string()));
+    }
+
+    #[test]
+    fn flatten_single_value_per_field_to_scalars() {
+        let body = serde_json::json!({
+            "zoneId": "J0-2D3068-B",
+            "dggrs": "[ogc-dggrs:IVEA7H]",
+            "links": [{"href": "https://example.invalid", "rel": "source"}],
+            "depths": [0],
+            "values": {
+                "dem__band1_mean": [{"data": [1424], "depth": 0, "shape": {"count": 1, "subZones": 1}}],
+                "country__country_name": [{"data": ["Canada"], "depth": 0, "shape": {"count": 1, "subZones": 1}}],
+            },
+        });
+        let row = flatten_zone_data("fallback", &body);
+        assert_eq!(
+            Value::Object(row),
+            serde_json::json!({"zone_id": "J0-2D3068-B", "dem__band1_mean": 1424, "country__country_name": "Canada"})
+        );
+    }
+
+    #[test]
+    fn flatten_keeps_sub_zone_arrays_and_multiple_depths() {
+        let body = serde_json::json!({
+            "values": {
+                "a": [{"data": [1, 2, 3], "depth": 1}],
+                "b": [{"data": [1], "depth": 0}, {"data": [1, 2], "depth": 1}],
+            },
+        });
+        let row = flatten_zone_data("Z1", &body);
+        assert_eq!(row["zone_id"], "Z1");
+        assert_eq!(row["a"], serde_json::json!([1, 2, 3]));
+        assert_eq!(row["b"], serde_json::json!({"0": [1], "1": [1, 2]}));
+    }
+
+    #[test]
+    fn ring_contains_distinguishes_inside_from_outside() {
+        let square: Vec<Value> = serde_json::from_str("[[0,0],[2,0],[2,2],[0,2],[0,0]]").unwrap();
+        assert!(ring_contains(&square, 1.0, 1.0));
+        assert!(!ring_contains(&square, 3.0, 1.0));
+        assert!(!ring_contains(&square, 1.0, -0.5));
+    }
+
+    #[test]
+    fn sample_evenly_spreads_across_the_list() {
+        let ids: Vec<String> = (0..10).map(|i| i.to_string()).collect();
+        assert_eq!(sample_evenly(ids.clone(), 20), ids);
+        assert_eq!(sample_evenly(ids, 5), vec!["0", "2", "4", "6", "8"]);
+    }
+
+    #[test]
+    fn point_of_only_for_points() {
+        assert_eq!(point_of(&req(Some(1.0), Some(2.0), None, None, None, None)), Some((1.0, 2.0)));
+        assert_eq!(point_of(&req(None, None, Some(1.0), Some(2.0), Some(3.0), Some(4.0))), None);
+    }
+
+    fn selection(id: &str, fields: &[&str]) -> CollectionSelectionInput {
+        CollectionSelectionInput {
+            collection_id: id.to_string(),
+            fields: fields.iter().map(|f| f.to_string()).collect(),
+            alias: None,
+            filter: None,
+        }
+    }
+
+    #[test]
+    fn parent_level_sits_default_depth_above_children() {
+        assert_eq!(parent_level(9, 6), (3, None));
+        assert_eq!(parent_level(6, 6), (0, None));
+        // Shallower than the default depth: parent is level 0, depth explicit.
+        assert_eq!(parent_level(4, 6), (0, Some(4)));
+    }
+
+    #[test]
+    fn single_collection_request_is_a_plain_get() {
+        let l = parquet_request("https://api.example", "IVEA7H", "C0-1A", &[selection("sentinel-2-l2a", &["B04"])], None, None);
+        assert_eq!(l["method"], "GET");
+        assert_eq!(
+            l["url"],
+            "https://api.example/collections/sentinel-2-l2a/dggs/IVEA7H/zones/C0-1A/data?f=parquet"
+        );
+        assert!(l.get("body").is_none());
+    }
+
+    #[test]
+    fn several_collections_request_is_one_combined_post() {
+        let cols = [selection("canada_dem", &["band1_mean"]), selection("overture_admin0", &["country_name"])];
+        let l = parquet_request("https://api.example", "IVEA7H", "C0-1A", &cols, Some("2024-06-01T00:00:00Z"), Some(4));
+        assert_eq!(l["method"], "POST");
+        assert_eq!(
+            l["url"],
+            "https://api.example/dggs/IVEA7H/zones/C0-1A/data?f=parquet&datetime=2024-06-01T00%3A00%3A00Z&zone-depth=4"
+        );
+        assert_eq!(l["body"]["collections"][1]["id"], "overture_admin0");
+    }
+
+    #[test]
+    fn only_collections_failing_at_every_zone_are_excluded() {
+        let cols = [selection("canada_dem", &["band1_mean"]), selection("overture_admin0", &["country_name"])];
+        let err = |zone: &str, id: &str| serde_json::json!({"zone_id": zone, "collection_id": id});
+        let everywhere = [err("a", "canada_dem"), err("b", "canada_dem")];
+        assert_eq!(failed_everywhere(&cols, &everywhere, 2), vec!["canada_dem"]);
+        let somewhere = [err("a", "canada_dem")];
+        assert!(failed_everywhere(&cols, &somewhere, 2).is_empty());
+    }
+
+    #[test]
+    fn queryables_become_field_names_and_summaries() {
+        let props: serde_json::Map<String, Value> = serde_json::from_str(
+            r#"{
+                "zone_id": {"type": "string"},
+                "parcel_area_m2": {"type": "number", "title": "Total Parcel Area", "gi_dggs_stat": "sum", "gi_unit": null},
+                "parcel_section": {"type": "string", "title": "Cadastral section", "gi_dggs_stat": "majority"}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(queryable_field_names(&props), vec!["parcel_area_m2", "parcel_section"]);
+        assert_eq!(
+            Value::Array(field_summaries(&props)),
+            serde_json::json!([
+                {"name": "parcel_area_m2", "type": "number", "title": "Total Parcel Area", "stat": "sum"},
+                {"name": "parcel_section", "type": "string", "title": "Cadastral section", "stat": "majority"}
+            ])
+        );
+    }
+
+    #[test]
+    fn omitted_fields_deserialize_as_empty() {
+        let c: CollectionSelectionInput = serde_json::from_str(r#"{"collection_id": "cadastre_parcelles"}"#).unwrap();
+        assert!(c.fields.is_empty());
+    }
+
+    #[test]
+    fn summarize_numbers_and_categories() {
+        let rows = vec![
+            serde_json::json!({"zone_id": "a", "elev": 10, "country": "CA", "sub": [1, 2]}),
+            serde_json::json!({"zone_id": "b", "elev": 30, "country": "CA", "sub": [3]}),
+            serde_json::json!({"zone_id": "c", "elev": null, "country": "US", "sub": [6]}),
+        ];
+        let s = summarize(&rows);
+        assert!(!s.contains_key("zone_id"));
+        assert_eq!(s["elev"], serde_json::json!({"min": 10.0, "mean": 20.0, "max": 30.0, "count": 2}));
+        assert_eq!(s["sub"]["mean"], 3.0);
+        assert_eq!(s["country"]["top"][0], serde_json::json!({"value": "CA", "count": 2}));
+        assert_eq!(s["country"]["distinct"], 2);
     }
 
     #[test]
