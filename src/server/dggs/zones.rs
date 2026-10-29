@@ -166,6 +166,17 @@ fn ring_contains(ring: &[Value], lon: f64, lat: f64) -> bool {
     inside
 }
 
+/// Up to `max` ids spread evenly across `ids`, instead of the first `max`.
+/// The backend lists zones in id order, which is spatially clustered, so
+/// truncating to the head of the list samples one corner of the area.
+pub(crate) fn sample_evenly(ids: Vec<String>, max: usize) -> Vec<String> {
+    if ids.len() <= max {
+        return ids;
+    }
+    let step = ids.len() as f64 / max as f64;
+    (0..max).map(|i| ids[(i as f64 * step) as usize].clone()).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,5 +187,12 @@ mod tests {
         assert!(ring_contains(&square, 1.0, 1.0));
         assert!(!ring_contains(&square, 3.0, 1.0));
         assert!(!ring_contains(&square, 1.0, -0.5));
+    }
+
+    #[test]
+    fn sample_evenly_spreads_across_the_list() {
+        let ids: Vec<String> = (0..10).map(|i| i.to_string()).collect();
+        assert_eq!(sample_evenly(ids.clone(), 20), ids);
+        assert_eq!(sample_evenly(ids, 5), vec!["0", "2", "4", "6", "8"]);
     }
 }

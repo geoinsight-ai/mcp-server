@@ -33,12 +33,15 @@ Given an insight (by name or id) and a location (`lon`/`lat`, or a
 1. Resolve the insight to a concept (`GET /concepts/{id}`), which carries which
    collection(s) serve it and the DGGS resolution to sample at
    (`processing[].dggs_refinement_level`).
-2. Find the DGGRS grid for that collection (`GET /collections/{id}/dggs`, first entry
-   unless overridden).
-3. Find the zone(s) at that resolution covering the location (`GET .../zones` with a
-   bbox filter — a point is expanded to a small epsilon box first; see gotcha below).
+2. Find the DGGRS grid for that collection (`GET /collections/{id}/dggs`, preferring
+   `IVEA7H` — see gotcha below — unless overridden).
+3. Find the zone(s) at that resolution covering the location. A point resolves to the
+   **single zone containing it** (zone polygons via `f=geojson`, point-in-polygon), not
+   the 2-3 neighbours its small search box overlaps; an area to every zone it
+   intersects, sampled **evenly** across the list if there are more than 64.
 4. Fetch each zone's own value (`GET .../zones/{id}/data?zone-depth=0`, one call per
-   zone, capped at 64 and run concurrently).
+   zone, run concurrently). A zone that fails is listed under `errors` and left out of
+   the reduction; only if every zone fails is the call an error.
 5. Reduce each property across the sampled zones using **that property's own
    configured statistic** (`gi_dggs_stat` from `GET /collections/{id}/queryables` — e.g.
    `mean` for a numeric property like NDVI, `majority` for a categorical one like a
@@ -47,8 +50,8 @@ Given an insight (by name or id) and a location (`lon`/`lat`, or a
    across the sampled zones.
 
 The result is one JSON object: the insight, which collection/grid/resolution were used,
-how many zones were sampled, and a `values` map of `{ value, stat, unit, sampled_zones }`
-per property.
+how many zones were sampled, a `values` map of `{ value, stat, unit, sampled_zones }`
+per property, and `errors` when some zones failed.
 
 ### `get_data`: raw values for the model, Parquet requests for the map
 

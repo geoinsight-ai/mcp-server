@@ -12,8 +12,9 @@ use serde_json::Value;
 use super::collections::queryable_field_names;
 use crate::server::dggs::extent::{ExtentArgs, build_bbox};
 use self::parquet::{MAX_PARQUET_REQUESTS, failed_everywhere, parent_level, parquet_request};
-use self::rows::{flatten_zone_data, sample_evenly, summarize};
-use crate::server::{DggsServer, MAX_ZONES_PER_QUERY, caller_bearer_token, enc, pretty};
+use self::rows::{flatten_zone_data, summarize};
+use crate::server::dggs::zones::sample_evenly;
+use crate::server::{DggsServer, MAX_ZONES_PER_QUERY, caller_bearer_token, enc, pretty, zone_error};
 
 /// `get_data`'s zone level when the caller doesn't specify one. `get_insight`
 /// instead reads a concept-specific resolution, but `get_data` has no concept
@@ -64,18 +65,6 @@ pub(super) fn collections_body(collections: &[CollectionSelectionInput]) -> Valu
             "alias": c.alias,
             "filter": c.filter,
         })).collect::<Vec<_>>(),
-    })
-}
-
-/// A failed zone/collection fetch, reported alongside the rows that did
-/// succeed. Carries the backend's own `hint` when it gave one.
-fn zone_error(zone_id: &str, collection: Option<&CollectionSelectionInput>, err: &McpError) -> Value {
-    let hint = err.data.as_ref().and_then(|d| d.get("hint")).cloned();
-    serde_json::json!({
-        "zone_id": zone_id,
-        "collection_id": collection.map(|c| &c.collection_id),
-        "message": err.message,
-        "hint": hint,
     })
 }
 
@@ -269,7 +258,7 @@ impl DggsServer {
             Err(err) => err,
         };
         if collections.len() == 1 {
-            return (None, vec![zone_error(zone_id, Some(&collections[0]), &err)]);
+            return (None, vec![zone_error(zone_id, Some(&collections[0].collection_id), &err)]);
         }
 
         let mut row: Option<serde_json::Map<String, Value>> = None;
@@ -283,7 +272,7 @@ impl DggsServer {
                 Ok(body) => row
                     .get_or_insert_with(serde_json::Map::new)
                     .extend(flatten_zone_data(zone_id, &body)),
-                Err(err) => errors.push(zone_error(zone_id, Some(collection), &err)),
+                Err(err) => errors.push(zone_error(zone_id, Some(&collection.collection_id), &err)),
             }
         }
         (row, errors)
