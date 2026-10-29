@@ -112,6 +112,15 @@ independent of this server, worth their own bug reports against `ogc-dggs-api`):
   that can be surprisingly deep (thousands of values for one small zone) — both tools
   always pass `zone-depth=0` unless you override it, to keep responses bounded.
 
+- Live STAC collections (e.g. `sentinel-2-l2a`) make the API search Copernicus once per
+  zone request, and Copernicus rate-limits bursts — a 64-zone area query on Jasper
+  National Park was refused with `429 Too Many Requests`, which the API passes on as a
+  **500** whose hint contains "Too Many Requests". A burst of 8 still had half refused, while 4
+  got through, so this server keeps at most 4 per-zone requests in flight per tool call,
+  and retries a rate-limited response (a real 429, or a 5xx with that text) up to 3 times,
+  honouring `Retry-After` or backing off ~1s/2s/4s with jitter so a refused burst doesn't
+  retry all at once.
+
 **Not handled yet**: place names ("Lisbon") aren't geocoded — both tools take
 coordinates only, relying on the calling agent's own geographic knowledge to turn a
 place into a point/bbox. Revisit if that turns out not to be precise enough.

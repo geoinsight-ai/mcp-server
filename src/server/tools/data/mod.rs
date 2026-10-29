@@ -1,7 +1,6 @@
 mod parquet;
 mod rows;
 
-use futures::future::join_all;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, tool, tool_router};
@@ -14,7 +13,7 @@ use crate::server::dggs::extent::{ExtentArgs, build_bbox};
 use self::parquet::{MAX_PARQUET_REQUESTS, failed_everywhere, parent_level, parquet_request};
 use self::rows::{flatten_zone_data, summarize};
 use crate::server::dggs::zones::sample_evenly;
-use crate::server::{DggsServer, MAX_ZONES_PER_QUERY, caller_bearer_token, enc, pretty, zone_error};
+use crate::server::{DggsServer, MAX_ZONES_PER_QUERY, bounded, caller_bearer_token, enc, pretty, zone_error};
 
 /// `get_data`'s zone level when the caller doesn't specify one. `get_insight`
 /// instead reads a concept-specific resolution, but `get_data` has no concept
@@ -137,7 +136,7 @@ impl DggsServer {
         let (parent_level, request_depth) = parent_level(children_level, default_depth);
         let parent_ids = self.extent_zone_ids(anchor, &dggrs_id, &req.extent, &bbox, parent_level, caller_token);
 
-        let fetches = join_all(zone_ids.iter().map(|zone_id| {
+        let fetches = bounded(zone_ids.iter().map(|zone_id| {
             self.zone_row(
                 &dggrs_id,
                 zone_id,
