@@ -17,7 +17,7 @@ use std::sync::Arc;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{ServerCapabilities, ServerInfo};
 use rmcp::service::RequestContext;
-use rmcp::{RoleServer, ServerHandler, tool_handler};
+use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool_handler};
 use serde_json::Value;
 
 use crate::client::ApiClient;
@@ -33,6 +33,19 @@ fn pretty(value: &Value) -> String {
 
 fn enc(segment: &str) -> String {
     urlencoding::encode(segment).into_owned()
+}
+
+/// A failed per-zone fetch, reported alongside the results that did succeed
+/// (`get_data`'s rows, `get_insight`'s values). Carries the backend's own
+/// `hint` when it gave one.
+fn zone_error(zone_id: &str, collection_id: Option<&str>, err: &McpError) -> Value {
+    let hint = err.data.as_ref().and_then(|d| d.get("hint")).cloned();
+    serde_json::json!({
+        "zone_id": zone_id,
+        "collection_id": collection_id,
+        "message": err.message,
+        "hint": hint,
+    })
 }
 
 /// The caller's own bearer token, when this request arrived over the

@@ -10,7 +10,8 @@ use serde_json::Value;
 
 use crate::server::dggs::aggregate::{majority, reduce};
 use crate::server::dggs::extent::{ExtentArgs, build_bbox};
-use crate::server::{DggsServer, MAX_ZONES_PER_QUERY, caller_bearer_token, enc, pretty};
+use crate::server::dggs::zones::sample_evenly;
+use crate::server::{DggsServer, MAX_ZONES_PER_QUERY, caller_bearer_token, enc, pretty, zone_error};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct GetInsightRequest {
@@ -30,6 +31,29 @@ struct GetInsightRequest {
     datetime: Option<String>,
 }
 
+/// Each sampled zone's property values, grouped by property, plus an
+/// `errors` entry for every zone that failed — so one bad zone costs its own
+/// samples, not the whole answer.
+fn collect_zone_values(
+    zone_ids: &[String],
+    results: Vec<Result<HashMap<String, Value>, McpError>>,
+    collection_id: &str,
+) -> (HashMap<String, Vec<Value>>, Vec<Value>) {
+    let mut per_property: HashMap<String, Vec<Value>> = HashMap::new();
+    let mut errors = Vec::new();
+    for (zone_id, result) in zone_ids.iter().zip(results) {
+        match result {
+            Ok(zone) => {
+                for (col, value) in zone {
+                    per_property.entry(col).or_default().push(value);
+                }
+            }
+            Err(err) => errors.push(zone_error(zone_id, Some(collection_id), &err)),
+        }
+    }
+    (per_property, errors)
+}
+
 #[tool_router(router = insights_router, vis = "pub(crate)")]
 impl DggsServer {
     #[tool(
@@ -42,7 +66,7 @@ impl DggsServer {
     }
 
     #[tool(
-        description = "Get an insight's value for a location or area — the main data-access tool. Pass an insight (e.g. \"ndvi\", \"burn_scar_analysis\"; see list_insights) and either a point (lon/lat) or an area (min_lon/min_lat/max_lon/max_lat). This resolves the insight's data source and DGGS resolution, samples the zone(s) covering the location, and returns one aggregated value per property using that property's own configured statistic (mean, max, ...) — you get a location, not a list of DGGS zones to interpret yourself."
+        description = "Get an insight's value for a location or area — the main data-access tool. Pass an insight (e.g. \"ndvi\", \"burn_scar_analysis\"; see list_insights) and either a point (lon/lat) or an area (min_lon/min_lat/max_lon/max_lat). This resolves the insight's data source and DGGS resolution, samples the zone(s) covering the location (the single zone containing a point; up to 64 zones spread evenly across an area), and returns one aggregated value per property using that property's own configured statistic (mean, max, ...) — you get a location, not a list of DGGS zones to interpret yourself. Zones that fail are listed under `errors`; the value comes from the zones that succeeded."
     )]
     async fn get_insight(
         &self,
@@ -101,8 +125,10 @@ impl DggsServer {
 
         let bbox = build_bbox(&req.extent)?;
 
-        let mut zone_ids = self
-            .list_zone_ids(&collection_id, &dggrs_id, &bbox, zone_level, caller_token)
+        // A point resolves to the one zone containing it, not the 2-3
+        // neighbours its small search box overlaps (see `extent_zone_ids`).
+        let zone_ids = self
+            .extent_zone_ids(&collection_id, &dggrs_id, &req.extent, &bbox, zone_level, caller_token)
             .await?;
         if zone_ids.is_empty() {
             return Err(McpError::invalid_params(
@@ -112,7 +138,7 @@ impl DggsServer {
         }
         let zones_matched = zone_ids.len();
         let zones_truncated = zones_matched > MAX_ZONES_PER_QUERY;
-        zone_ids.truncate(MAX_ZONES_PER_QUERY);
+        let zone_ids = sample_evenly(zone_ids, MAX_ZONES_PER_QUERY);
 
         let stats = self.property_stats(&collection_id, caller_token).await?;
 
@@ -125,11 +151,14 @@ impl DggsServer {
         // its own type: numeric properties average/sum/min/max per
         // `gi_dggs_stat`, categorical ones (e.g. `gi_dggs_stat: "majority"`
         // on a country name) take the most common value across zones.
-        let mut per_property: HashMap<String, Vec<Value>> = HashMap::new();
-        for result in results {
-            for (col, value) in result? {
-                per_property.entry(col).or_default().push(value);
-            }
+        // A zone that fails is reported under `errors` rather than failing
+        // the whole answer; only if every zone fails is the call an error.
+        let (per_property, errors) = collect_zone_values(&zone_ids, results, &collection_id);
+        if errors.len() == zone_ids.len() {
+            return Err(McpError::invalid_params(
+                "no data for any sampled zone; see `errors` for each failure",
+                Some(serde_json::json!({ "errors": errors })),
+            ));
         }
 
         let mut values = serde_json::Map::new();
@@ -156,7 +185,7 @@ impl DggsServer {
             );
         }
 
-        let result = serde_json::json!({
+        let mut result = serde_json::json!({
             "insight": { "id": concept_id, "name": concept_name },
             "collection_id": collection_id,
             "dggrs_id": dggrs_id,
@@ -166,6 +195,9 @@ impl DggsServer {
             "zones_truncated": zones_truncated,
             "values": values,
         });
+        if !errors.is_empty() {
+            result["errors"] = Value::Array(errors);
+        }
         Ok(pretty(&result))
     }
 
@@ -310,5 +342,27 @@ impl DggsServer {
                 Some((col, value))
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failing_zone_is_reported_not_fatal() {
+        let zones = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+        let ok = |v: f64| Ok(HashMap::from([("ndvi".to_string(), serde_json::json!(v))]));
+        let failed = Err(McpError::internal_error(
+            "ogc-dggs-api returned 500",
+            Some(serde_json::json!({"hint": "No regions: bbox is empty"})),
+        ));
+        let (values, errors) = collect_zone_values(&zones, vec![ok(0.2), failed, ok(0.4)], "sentinel-2-l2a");
+
+        assert_eq!(values["ndvi"], vec![serde_json::json!(0.2), serde_json::json!(0.4)]);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0]["zone_id"], "B");
+        assert_eq!(errors[0]["collection_id"], "sentinel-2-l2a");
+        assert_eq!(errors[0]["hint"], "No regions: bbox is empty");
     }
 }
