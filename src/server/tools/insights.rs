@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use futures::future::join_all;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, tool, tool_router};
@@ -11,7 +10,7 @@ use serde_json::Value;
 use crate::server::dggs::aggregate::{majority, reduce};
 use crate::server::dggs::extent::{ExtentArgs, build_bbox};
 use crate::server::dggs::zones::sample_evenly;
-use crate::server::{DggsServer, MAX_ZONES_PER_QUERY, caller_bearer_token, enc, pretty, zone_error};
+use crate::server::{DggsServer, MAX_ZONES_PER_QUERY, bounded, caller_bearer_token, enc, pretty, zone_error};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct GetInsightRequest {
@@ -145,7 +144,7 @@ impl DggsServer {
         let fetches = zone_ids
             .iter()
             .map(|zone_id| self.zone_values(&collection_id, &dggrs_id, zone_id, req.datetime.as_deref(), caller_token));
-        let results = join_all(fetches).await;
+        let results = bounded(fetches).await;
 
         // Each property is collected raw first, then reduced according to
         // its own type: numeric properties average/sum/min/max per

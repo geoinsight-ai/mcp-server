@@ -27,6 +27,28 @@ use crate::client::ApiClient;
 /// thousands of backend requests.
 const MAX_ZONES_PER_QUERY: usize = 64;
 
+/// How many per-zone backend requests one tool call keeps in flight. An area
+/// query can fan out to `MAX_ZONES_PER_QUERY` zones, and on a live STAC
+/// collection each one is its own upstream catalogue search: all 64 at once
+/// got Copernicus to rate-limit Jasper National Park, and a burst of 8
+/// still had half refused, while 4 at a time got through. (`ApiClient` also
+/// retries rate-limited requests.)
+const MAX_CONCURRENT_ZONE_REQUESTS: usize = 4;
+
+/// Runs `futures` at most `MAX_CONCURRENT_ZONE_REQUESTS` at a time, returning
+/// their outputs in input order (callers zip them back to their zone ids).
+async fn bounded<F: std::future::Future>(futures: impl IntoIterator<Item = F>) -> Vec<F::Output> {
+    use futures::stream::StreamExt;
+    // Collected first: streaming a lazy `.map(|zone| ..)` iterator directly
+    // trips rustc's "FnOnce is not general enough" inside the `Send` tool
+    // futures. Futures don't start until polled, so this changes nothing.
+    let futures: Vec<F> = futures.into_iter().collect();
+    futures::stream::iter(futures)
+        .buffered(MAX_CONCURRENT_ZONE_REQUESTS)
+        .collect()
+        .await
+}
+
 fn pretty(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
@@ -104,5 +126,33 @@ impl ServerHandler for DggsServer {
              many backend HTTP requests this session has made in total, since a single \
              get_insight/get_data call can fan out to many.",
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn bounded_caps_concurrency_and_keeps_order() {
+        let in_flight = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let outputs = bounded((0..40).map(|i| {
+            let (in_flight, peak) = (&in_flight, &peak);
+            async move {
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                // Later items finish first, so ordering is really tested.
+                tokio::time::sleep(Duration::from_millis(40 - i)).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                i
+            }
+        }))
+        .await;
+        assert_eq!(outputs, (0..40).collect::<Vec<_>>());
+        assert_eq!(peak.load(Ordering::SeqCst), MAX_CONCURRENT_ZONE_REQUESTS);
     }
 }
