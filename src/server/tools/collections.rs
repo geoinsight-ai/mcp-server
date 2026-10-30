@@ -19,6 +19,17 @@ pub(super) fn queryable_field_names(props: &serde_json::Map<String, Value>) -> V
     props.keys().filter(|name| *name != "zone_id").cloned().collect()
 }
 
+/// The finest pixel size, m, among `fields` of a queryables schema
+/// (`gi_gsd`, which raster collections record per band). `None` when none
+/// has one, as for vector collections: their detail isn't bounded by pixels.
+pub(super) fn finest_gsd<'a>(props: &serde_json::Map<String, Value>, fields: impl IntoIterator<Item = &'a String>) -> Option<f64> {
+    fields
+        .into_iter()
+        .filter_map(|field| props.get(field)?.get("gi_gsd")?.as_f64())
+        .filter(|gsd| *gsd > 0.0)
+        .reduce(f64::min)
+}
+
 /// A queryables schema as a compact field list for `get_collection`: what
 /// each field is and how it aggregates across zones, so the model can pick
 /// fields and explain values (e.g. "Total Parcel Area", summed).
@@ -113,5 +124,17 @@ mod tests {
                 {"name": "parcel_section", "type": "string", "title": "Cadastral section", "stat": "majority"}
             ])
         );
+    }
+
+    #[test]
+    fn finest_gsd_is_the_smallest_pixel_among_the_chosen_fields() {
+        let props: serde_json::Map<String, Value> = serde_json::from_str(
+            r#"{"B04_10m": {"gi_gsd": 10}, "B12_20m": {"gi_gsd": 20}, "B01_60m": {"gi_gsd": 60}, "name": {"type": "string"}}"#,
+        )
+        .unwrap();
+        let fields = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert_eq!(finest_gsd(&props, &fields(&["B12_20m", "B01_60m"])), Some(20.0));
+        assert_eq!(finest_gsd(&props, &fields(&["B04_10m", "B12_20m"])), Some(10.0));
+        assert_eq!(finest_gsd(&props, &fields(&["name"])), None);
     }
 }

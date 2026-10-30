@@ -1,25 +1,41 @@
 use serde_json::Value;
 
 use super::{CollectionSelectionInput, collections_body};
+use crate::server::dggs::level::Levels;
 use crate::server::enc;
 
-/// Caps how many parent-zone Parquet requests one `get_data` call returns.
-/// Each one expands to `default_depth` levels of children (~7^6 on IVEA7H),
-/// so this bounds what the map is asked to load. Provisional until we know
-/// what the map draws comfortably.
-pub(super) const MAX_PARQUET_REQUESTS: usize = 16;
+/// Caps how many parent-zone Parquet requests one call returns. Each one
+/// expands to `default_depth` levels of children (~7^6 on IVEA7H), so this
+/// bounds what the map is asked to load. Provisional until we know what the
+/// map draws comfortably.
+const MAX_PARQUET_REQUESTS: usize = 16;
 
-/// Parent level for the Parquet requests, and the `zone-depth` to send with
-/// them. A request omits `zone-depth` so the backend expands its parent by
-/// `default_depth` (and can serve it from cache); that only reaches
-/// `children_level` when the parent sits `default_depth` levels above it.
-/// For a children level shallower than that, the parent is level 0 and the
-/// depth is sent explicitly.
-pub(super) fn parent_level(children_level: u32, default_depth: u32) -> (u32, Option<u32>) {
-    if children_level >= default_depth {
-        (children_level - default_depth, None)
-    } else {
-        (0, Some(children_level))
+/// The map's share of a `get_data`/`get_insight` result, added to `result`:
+/// the levels it draws (`parent_level`, `children_level`), the collections
+/// it loads, and one Parquet request per parent zone in `parent_ids`. Both
+/// tools share this so a map client reads them the same way.
+pub(in crate::server::tools) fn add_map_requests(
+    result: &mut Value,
+    base_url: &str,
+    dggrs_id: &str,
+    levels: &Levels,
+    parent_ids: &[String],
+    collections: &[CollectionSelectionInput],
+    datetime: Option<&str>,
+) {
+    let requests: Vec<Value> = parent_ids
+        .iter()
+        .take(MAX_PARQUET_REQUESTS)
+        .map(|parent| parquet_request(base_url, dggrs_id, parent, collections, datetime, levels.request_depth))
+        .collect();
+
+    result["parent_level"] = serde_json::json!(levels.parent);
+    result["children_level"] = serde_json::json!(levels.children);
+    result["collections"] = serde_json::json!(collections.iter().map(|c| &c.collection_id).collect::<Vec<_>>());
+    result["parquet_requests"] = Value::Array(requests);
+    if parent_ids.len() > MAX_PARQUET_REQUESTS {
+        result["requests_truncated"] = Value::Bool(true);
+        result["parent_zones_matched"] = serde_json::json!(parent_ids.len());
     }
 }
 
@@ -28,7 +44,7 @@ pub(super) fn parent_level(children_level: u32, default_depth: u32) -> (u32, Opt
 /// plain per-collection GET (which also accepts ids the cross-collection
 /// endpoint rejects, like `sentinel-2-l2a`); otherwise the cross-collection
 /// POST, so several collections come back as one combined view.
-pub(super) fn parquet_request(
+fn parquet_request(
     base_url: &str,
     dggrs_id: &str,
     parent_zone_id: &str,
@@ -97,11 +113,18 @@ mod tests {
     }
 
     #[test]
-    fn parent_level_sits_default_depth_above_children() {
-        assert_eq!(parent_level(9, 6), (3, None));
-        assert_eq!(parent_level(6, 6), (0, None));
-        // Shallower than the default depth: parent is level 0, depth explicit.
-        assert_eq!(parent_level(4, 6), (0, Some(4)));
+    fn map_requests_carry_levels_collections_and_a_capped_request_list() {
+        let levels = Levels { parent: 7, children: 13, answer: 9, request_depth: None };
+        let parents: Vec<String> = (0..20).map(|i| format!("P{i}")).collect();
+        let mut result = serde_json::json!({});
+        add_map_requests(&mut result, "https://api.example", "IVEA7H", &levels, &parents, &[selection("sentinel-2-l2a", &["B04_10m"])], None);
+
+        assert_eq!(result["parent_level"], 7);
+        assert_eq!(result["children_level"], 13);
+        assert_eq!(result["collections"], serde_json::json!(["sentinel-2-l2a"]));
+        assert_eq!(result["parquet_requests"].as_array().unwrap().len(), MAX_PARQUET_REQUESTS);
+        assert_eq!(result["requests_truncated"], true);
+        assert_eq!(result["parent_zones_matched"], 20);
     }
 
     #[test]
