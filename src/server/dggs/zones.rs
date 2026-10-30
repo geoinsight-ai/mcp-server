@@ -2,11 +2,8 @@ use rmcp::ErrorData as McpError;
 use serde_json::Value;
 
 use super::extent::{ExtentArgs, point_of};
+use super::level::Grid;
 use crate::server::{DggsServer, enc};
-
-/// The backend's zone-depth expansion when a grid doesn't report its own
-/// `default_depth` (IVEA7H reports 6).
-const FALLBACK_DEFAULT_DEPTH: u32 = 6;
 
 /// DGGRS ids to prefer, in order, when a collection supports several and the
 /// caller didn't pin one. See `default_dggrs`.
@@ -40,18 +37,20 @@ impl DggsServer {
             })
     }
 
-    /// How many levels the backend expands a zone by when `zone-depth` is
-    /// omitted (`GET /dggs/{id}` → `default_depth`). Parquet requests omit it so the
-    /// backend's cache applies; this tells us which level that lands on.
-    pub(crate) async fn default_depth(&self, dggrs_id: &str, caller_token: Option<&str>) -> u32 {
+    /// What the level choice needs to know about a grid, from its
+    /// description (`GET /dggs/{id}` → `defaultDepth`, `maxRefinementLevel`).
+    /// A grid that can't be described falls back to IVEA7H's values rather
+    /// than failing the question.
+    pub(crate) async fn grid(&self, dggrs_id: &str, caller_token: Option<&str>) -> Grid {
         let path = format!("/dggs/{}", enc(dggrs_id));
-        self.client
-            .get_json(&path, &[], caller_token)
-            .await
-            .ok()
-            .and_then(|body| body.get("default_depth").and_then(Value::as_u64))
-            .map(|d| d as u32)
-            .unwrap_or(FALLBACK_DEFAULT_DEPTH)
+        let body = self.client.get_json(&path, &[], caller_token).await.ok();
+        let number = |key: &str| {
+            body.as_ref()
+                .and_then(|b| b.get(key))
+                .and_then(Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok())
+        };
+        Grid::new(dggrs_id, number("defaultDepth"), number("maxRefinementLevel"))
     }
 
     /// Zones covering the extent at `zone_level`: the one containing a point,

@@ -31,11 +31,14 @@ Given an insight (by name or id) and a location (`lon`/`lat`, or a
 `min_lon`/`min_lat`/`max_lon`/`max_lat` box):
 
 1. Resolve the insight to a concept (`GET /concepts/{id}`), which carries which
-   collection(s) serve it and the DGGS resolution to sample at
-   (`processing[].dggs_refinement_level`).
+   collection(s) serve it and the bands it reads from each
+   (`collections[].properties`, e.g. B8A and B12 for burn scars). Only those bands are
+   fetched and reported; a collection the concept doesn't list falls back to all fields.
 2. Find the DGGRS grid for that collection (`GET /collections/{id}/dggs`, preferring
    `IVEA7H` — see gotcha below — unless overridden).
-3. Find the zone(s) at that resolution covering the location. A point resolves to the
+3. Choose the zone levels from the place and the data (see
+   [Zone levels](#zone-levels)), then find the zone(s) at the answer level covering the
+   location. A point resolves to the
    **single zone containing it** (zone polygons via `f=geojson`, point-in-polygon), not
    the 2-3 neighbours its small search box overlaps; an area to every zone it
    intersects, sampled **evenly** across the list if there are more than 64.
@@ -51,7 +54,9 @@ Given an insight (by name or id) and a location (`lon`/`lat`, or a
 
 The result is one JSON object: the insight, which collection/grid/resolution were used,
 how many zones were sampled, a `values` map of `{ value, stat, unit, sampled_zones }`
-per property, and `errors` when some zones failed.
+per band, `errors` when some zones failed, and the same map fields as `get_data`
+(`parent_level`, `children_level`, `collections`, `parquet_requests`), so a map can draw
+the insight's bands over the whole place.
 
 ### `get_data`: raw values for the model, Parquet requests for the map
 
@@ -65,10 +70,8 @@ passes through the model or this server.
 
 1. Picks a DGGRS grid (first listed collection's `GET .../dggs`, preferring `IVEA7H`
    when available — see gotcha below — unless overridden).
-2. Takes the **children level** from `zone_level` (default 9; to be derived from each
-   collection's resolution once collections record one) and the **parent level** from it:
-   children level minus the grid's `default_depth` (`GET /dggs/{id}`, 6 on IVEA7H).
-3. Resolves the location at the children level. A point resolves to the **single zone
+2. Chooses the zone levels from the place and the data (see [Zone levels](#zone-levels)).
+3. Resolves the location at the answer level. A point resolves to the **single zone
    containing it** (zone polygons via `f=geojson`, point-in-polygon), not the 2-3
    neighbours its small search box overlaps; an area to every zone it intersects.
 4. **Small answer:**
@@ -89,6 +92,30 @@ passes through the model or this server.
    others' values still come back; each failure is listed under `errors` with the
    backend's `hint`. A collection that fails at **every** sampled zone is left out of the
    Parquet requests (`excluded_collections`). Only if no zone returns anything is the call an error.
+
+### Zone levels
+
+Neither tool uses a fixed zone level. Each picks three from the size of the place
+(the bbox's longer side; a point counts as 1 km) and the finest pixel size of the
+chosen fields (`gi_gsd` in the collection's queryables, which raster collections record
+per band; vector collections have none):
+
+- **children** (what the map draws) = the place's level plus the grid's default depth
+  (`defaultDepth` from `GET /dggs/{id}`, 6 on IVEA7H), but never finer than the
+  data's pixel size: below that, children would only repeat the same pixel. The
+  place's level is the finest whose zones are still as wide as the place.
+- **parent** (one Parquet request each) = children minus the default depth, so the
+  backend expands each parent by its cached default. Children shallower than the
+  default depth use level-0 parents and send `zone-depth` explicitly.
+- **answer** (what the small answer is sampled at) = the zone containing a point at
+  the children level, or two levels below the place's level for an area (~49 zones).
+
+Zone widths come from the grid's aperture (read from its id, e.g. 7 in `IVEA7H`):
+an icosahedral grid has `10·aperture^level + 2` equal-area zones per level. On IVEA7H
+that is ~21 km at level 6, ~1.1 km at 9 and ~61 m at 12. For example, a ~3 km town on
+10 m Sentinel-2 bands draws level-13 children (~23 m) under level-7 parents, while a
+~100 km park on vector data draws level 10 under level 4. Passing `zone_level`
+overrides the children level.
 
 `zone_depth` (default `"0"`, one value per zone) passes straight through to the
 backend's own zone-depth expansion if you want finer detail *within* a resolved zone;
@@ -205,6 +232,7 @@ all logs go to stderr via `tracing`.
       (`parquet.rs`)
     - `stats.rs` — `get_call_stats`
   - `dggs/` — internal, shared by the tools: `extent.rs` (point/bbox arguments),
-    `zones.rs` (grid, depth and zone lookups), `aggregate.rs` (`mean`/`sum`/`min`/`max`/
+    `level.rs` (zone levels from place size and pixel size), `zones.rs` (grid and zone
+    lookups), `aggregate.rs` (`mean`/`sum`/`min`/`max`/
     `count` and majority vote)
 - `src/main.rs` — wiring: picks the stdio or HTTP transport
