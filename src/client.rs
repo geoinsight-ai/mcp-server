@@ -58,6 +58,7 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
 pub struct ApiClient {
     http: reqwest::Client,
     base_url: String,
+    public_base_url: String,
     token_provider: Option<TokenProvider>,
     /// Total requests sent to ogc-dggs-api this process, logged per-request
     /// (see `send`) so a single tool call's real fan-out (e.g. `get_insight`
@@ -82,15 +83,17 @@ impl ApiClient {
         Self {
             http,
             base_url: config.base_url.clone(),
+            public_base_url: config.public_base_url.clone(),
             token_provider,
             request_count: AtomicU64::new(0),
         }
     }
 
-    /// Base URL of the ogc-dggs-api instance, e.g. for building links the
-    /// caller fetches itself (see `get_data`'s `parquet_requests`).
-    pub fn base_url(&self) -> &str {
-        &self.base_url
+    /// Base URL of the ogc-dggs-api instance as the caller reaches it, for
+    /// building links the caller fetches itself (see `get_data`'s
+    /// `parquet_requests`) — not the one this client sends requests to.
+    pub fn public_base_url(&self) -> &str {
+        &self.public_base_url
     }
 
     /// Requests sent to ogc-dggs-api so far this process.
@@ -252,6 +255,7 @@ mod tests {
 
         let client = ApiClient::new(&AppConfig {
             base_url: format!("http://{addr}"),
+            public_base_url: format!("http://{addr}"),
             transport: Transport::Stdio,
             auth0: None,
             http_auth: None,

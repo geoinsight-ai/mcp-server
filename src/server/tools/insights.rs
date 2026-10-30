@@ -53,6 +53,28 @@ fn collect_zone_values(
     (per_property, errors)
 }
 
+/// One property's samples reduced to `{value, stat, sampled_zones}`. Zones
+/// with no value (`null`, e.g. a cloud-masked NDVI pixel) are left out
+/// first: otherwise one null among numbers would make the property look
+/// categorical and get a majority vote over floats instead of its
+/// configured statistic. `sampled_zones` counts only zones with a value.
+fn aggregate_property(samples: &[Value], stat: Option<String>) -> Value {
+    let present: Vec<Value> = samples.iter().filter(|v| !v.is_null()).cloned().collect();
+    let nums: Option<Vec<f64>> = present.iter().map(Value::as_f64).collect();
+    let (value, stat_name) = match nums {
+        Some(nums) if !nums.is_empty() => (
+            serde_json::json!(reduce(stat.as_deref(), &nums)),
+            stat.unwrap_or_else(|| "mean".to_string()),
+        ),
+        _ => (majority(&present), stat.unwrap_or_else(|| "majority".to_string())),
+    };
+    serde_json::json!({
+        "value": value,
+        "stat": stat_name,
+        "sampled_zones": present.len(),
+    })
+}
+
 #[tool_router(router = insights_router, vis = "pub(crate)")]
 impl DggsServer {
     #[tool(
@@ -163,25 +185,9 @@ impl DggsServer {
         let mut values = serde_json::Map::new();
         for (col, samples) in &per_property {
             let (stat, unit) = stats.get(col).cloned().unwrap_or((None, None));
-            let all_numeric = samples.iter().all(|v| v.as_f64().is_some());
-            let (value, stat_name) = if all_numeric {
-                let nums: Vec<f64> = samples.iter().filter_map(Value::as_f64).collect();
-                (
-                    serde_json::json!(reduce(stat.as_deref(), &nums)),
-                    stat.unwrap_or_else(|| "mean".to_string()),
-                )
-            } else {
-                (majority(samples), stat.unwrap_or_else(|| "majority".to_string()))
-            };
-            values.insert(
-                col.clone(),
-                serde_json::json!({
-                    "value": value,
-                    "stat": stat_name,
-                    "unit": unit,
-                    "sampled_zones": samples.len(),
-                }),
-            );
+            let mut summary = aggregate_property(samples, stat);
+            summary["unit"] = serde_json::json!(unit);
+            values.insert(col.clone(), summary);
         }
 
         let mut result = serde_json::json!({
@@ -363,5 +369,31 @@ mod tests {
         assert_eq!(errors[0]["zone_id"], "B");
         assert_eq!(errors[0]["collection_id"], "sentinel-2-l2a");
         assert_eq!(errors[0]["hint"], "No regions: bbox is empty");
+    }
+
+    #[test]
+    fn nulls_are_skipped_not_voted_on() {
+        let samples = serde_json::json!([0.2, null, 0.4, null]);
+        let summary = aggregate_property(samples.as_array().unwrap(), Some("mean".to_string()));
+        assert_eq!(summary["value"], 0.30000000000000004);
+        assert_eq!(summary["stat"], "mean");
+        assert_eq!(summary["sampled_zones"], 2);
+    }
+
+    #[test]
+    fn categorical_values_take_the_majority_ignoring_nulls() {
+        let samples = serde_json::json!([null, "CA", "US", "CA", null, null]);
+        let summary = aggregate_property(samples.as_array().unwrap(), None);
+        assert_eq!(summary["value"], "CA");
+        assert_eq!(summary["stat"], "majority");
+        assert_eq!(summary["sampled_zones"], 3);
+    }
+
+    #[test]
+    fn all_null_samples_give_a_null_value() {
+        let samples = serde_json::json!([null, null]);
+        let summary = aggregate_property(samples.as_array().unwrap(), Some("mean".to_string()));
+        assert_eq!(summary["value"], Value::Null);
+        assert_eq!(summary["sampled_zones"], 0);
     }
 }

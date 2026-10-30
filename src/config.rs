@@ -45,6 +45,11 @@ pub enum Transport {
 pub struct AppConfig {
     /// Base URL of the ogc-dggs-api instance, e.g. `http://localhost:30001`.
     pub base_url: String,
+    /// Base URL of the same ogc-dggs-api as reachable by the *caller*, for
+    /// links the caller fetches itself (`get_data`'s `parquet_requests`).
+    /// Differs from `base_url` in k8s, where `base_url` is in-cluster DNS
+    /// that nothing outside the cluster can resolve. Defaults to `base_url`.
+    pub public_base_url: String,
     pub transport: Transport,
     /// Only set (and only used) for stdio mode — always `None` in HTTP
     /// mode, enforced in `from_env`.
@@ -75,6 +80,9 @@ impl AppConfig {
             .unwrap_or_else(|_| "http://localhost:3001".to_string())
             .trim_end_matches('/')
             .to_string();
+        let public_base_url = env::var("OGC_DGGS_API_PUBLIC_URL")
+            .map(|url| url.trim_end_matches('/').to_string())
+            .unwrap_or_else(|_| base_url.clone());
 
         let auth0 = match (
             env::var("AUTH0_DOMAIN"),
@@ -144,6 +152,7 @@ impl AppConfig {
 
         Self {
             base_url,
+            public_base_url,
             transport,
             auth0,
             http_auth,

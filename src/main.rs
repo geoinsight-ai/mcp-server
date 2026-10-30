@@ -50,6 +50,7 @@ async fn main() -> anyhow::Result<()> {
 
             tracing::info!(
                 base_url = %config.base_url,
+                public_base_url = %config.public_base_url,
                 %bind_addr,
                 ?allowed_hosts,
                 "starting ogc-dggs-mcp (http)"

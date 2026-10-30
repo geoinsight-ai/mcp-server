@@ -176,7 +176,7 @@ impl DggsServer {
             .take(MAX_PARQUET_REQUESTS)
             .map(|parent| {
                 parquet_request(
-                    self.client.base_url(),
+                    self.client.public_base_url(),
                     &dggrs_id,
                     parent,
                     &request_collections,
