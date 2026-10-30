@@ -37,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
                 "starting ogc-dggs-mcp (stdio)"
             );
 
-            let server = DggsServer::new(client);
+            let server = DggsServer::for_stdio(client);
             let service = server.serve(rmcp::transport::stdio()).await?;
             service.waiting().await?;
         }

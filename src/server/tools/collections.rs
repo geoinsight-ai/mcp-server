@@ -74,8 +74,6 @@ impl DggsServer {
         Ok(pretty(&body))
     }
 
-    /// Per-property aggregation hints (`gi_dggs_stat`, `gi_unit`) for a
-    /// collection, from its queryables schema.
     /// A collection's queryables schema (`GET /collections/{id}/queryables`
     /// → `properties`): its field names, types, titles and `gi_*` hints.
     pub(super) async fn queryables(

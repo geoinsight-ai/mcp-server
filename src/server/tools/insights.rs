@@ -212,7 +212,7 @@ impl DggsServer {
     /// otherwise looks the name up (case-insensitive, exact match preferred
     /// over substring) against `GET /concepts`.
     async fn resolve_concept(&self, insight: &str, caller_token: Option<&str>) -> Result<Value, McpError> {
-        if let Ok(id) = insight.parse::<u8>() {
+        if let Ok(id) = insight.parse::<u64>() {
             return self
                 .client
                 .get_json(&format!("/concepts/{id}"), &[], caller_token)
@@ -290,14 +290,9 @@ impl DggsServer {
         collection_id: &str,
         caller_token: Option<&str>,
     ) -> Result<HashMap<String, (Option<String>, Option<String>)>, McpError> {
-        let path = format!("/collections/{}/queryables", enc(collection_id));
-        let body = self.client.get_json(&path, &[], caller_token).await?;
-        let props = body
-            .get("properties")
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        Ok(props
+        Ok(self
+            .queryables(collection_id, caller_token)
+            .await?
             .into_iter()
             .map(|(name, schema)| {
                 let stat = schema.get("gi_dggs_stat").and_then(Value::as_str).map(str::to_string);
