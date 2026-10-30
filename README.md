@@ -135,7 +135,8 @@ All configuration is via environment variables.
 
 | Variable | Required | Default | Purpose |
 | --- | --- | --- | --- |
-| `OGC_DGGS_API_BASE_URL` | no | `http://localhost:30001` | Base URL of the ogc-dggs-api instance to call |
+| `OGC_DGGS_API_BASE_URL` | no | `http://localhost:3001` | Base URL of the ogc-dggs-api instance to call |
+| `OGC_DGGS_API_PUBLIC_URL` | no | `OGC_DGGS_API_BASE_URL` | The same API's URL as the caller reaches it, used for `get_data`'s `parquet_requests`. Set it when `OGC_DGGS_API_BASE_URL` is an internal address (e.g. in-cluster DNS in k8s) |
 | `AUTH0_DOMAIN` | only for `list_insights`/`get_insight` | — | Auth0 tenant domain, e.g. `geoinsight.us.auth0.com` |
 | `AUTH0_CLIENT_ID` | only for `list_insights`/`get_insight` | — | Auth0 M2M application client id |
 | `AUTH0_CLIENT_SECRET` | only for `list_insights`/`get_insight` | — | Auth0 M2M application client secret |
