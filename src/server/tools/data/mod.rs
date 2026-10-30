@@ -91,7 +91,7 @@ impl DggsServer {
         // `fields` gets every field in its queryables schema, as explore's
         // own data view does.
         let mut collections = req.collections.clone();
-        for c in collections.iter_mut().filter(|c| c.fields.is_empty()) {
+        let lookups = collections.iter_mut().filter(|c| c.fields.is_empty()).map(|c| async move {
             c.fields = queryable_field_names(&self.queryables(&c.collection_id, caller_token).await?);
             if c.fields.is_empty() {
                 return Err(McpError::invalid_params(
@@ -99,7 +99,9 @@ impl DggsServer {
                     None,
                 ));
             }
-        }
+            Ok(())
+        });
+        futures::future::try_join_all(lookups).await?;
 
         let dggrs_id = match &req.dggrs_id {
             Some(d) => d.clone(),

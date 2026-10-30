@@ -28,7 +28,7 @@ pub async fn serve(
     allowed_hosts: Vec<String>,
     validator: Arc<BearerValidator>,
 ) -> anyhow::Result<()> {
-    let server = DggsServer::new(client);
+    let server = DggsServer::for_http(client);
 
     let config = StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts);
 

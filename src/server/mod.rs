@@ -96,14 +96,27 @@ pub struct DggsServer {
 }
 
 impl DggsServer {
-    pub fn new(client: ApiClient) -> Self {
+    /// Every tool, including `get_call_stats`: a stdio process serves one
+    /// caller, so its process-wide request count is that caller's own.
+    pub fn for_stdio(client: ApiClient) -> Self {
         Self {
             client: Arc::new(client),
-            tool_router: Self::insights_router()
-                + Self::collections_router()
-                + Self::data_router()
-                + Self::stats_router(),
+            tool_router: Self::data_tools() + Self::stats_router(),
         }
+    }
+
+    /// Every tool except `get_call_stats`: over HTTP one process serves every
+    /// customer, so its process-wide request count would expose all of
+    /// their load to each of them.
+    pub fn for_http(client: ApiClient) -> Self {
+        Self {
+            client: Arc::new(client),
+            tool_router: Self::data_tools(),
+        }
+    }
+
+    fn data_tools() -> ToolRouter<Self> {
+        Self::insights_router() + Self::collections_router() + Self::data_router()
     }
 }
 
@@ -122,9 +135,9 @@ impl ServerHandler for DggsServer {
              get_insight need this server's own Auth0 client-credentials configured (they call \
              the bearer-token-gated /concepts route); get_data, list_collections and \
              get_collection work without it. In HTTP mode, every request needs its own bearer \
-             token instead, which is forwarded to ogc-dggs-api as-is. get_call_stats reports how \
-             many backend HTTP requests this session has made in total, since a single \
-             get_insight/get_data call can fan out to many.",
+             token instead, which is forwarded to ogc-dggs-api as-is. In stdio mode only, \
+             get_call_stats reports how many backend HTTP requests this server has made in \
+             total, since a single get_insight/get_data call can fan out to many.",
         )
     }
 }
@@ -154,5 +167,27 @@ mod tests {
         .await;
         assert_eq!(outputs, (0..40).collect::<Vec<_>>());
         assert_eq!(peak.load(Ordering::SeqCst), MAX_CONCURRENT_ZONE_REQUESTS);
+    }
+
+    fn client() -> ApiClient {
+        ApiClient::new(&crate::config::AppConfig {
+            base_url: "http://localhost:3001".to_string(),
+            public_base_url: "http://localhost:3001".to_string(),
+            transport: crate::config::Transport::Stdio,
+            auth0: None,
+            http_auth: None,
+        })
+    }
+
+    #[test]
+    fn call_stats_are_only_exposed_over_stdio() {
+        let stdio = DggsServer::for_stdio(client());
+        let http = DggsServer::for_http(client());
+
+        assert!(stdio.tool_router.has_route("get_call_stats"));
+        assert!(!http.tool_router.has_route("get_call_stats"));
+        for tool in ["list_insights", "get_insight", "get_data", "list_collections", "get_collection"] {
+            assert!(stdio.tool_router.has_route(tool) && http.tool_router.has_route(tool), "{tool}");
+        }
     }
 }
