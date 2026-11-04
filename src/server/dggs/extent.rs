@@ -51,6 +51,26 @@ pub(crate) fn build_bbox(extent: &ExtentArgs) -> Result<String, McpError> {
     }
 }
 
+/// The extent as `[min_lon, min_lat, max_lon, max_lat]` degrees (a point as
+/// its tiny search box), or `None` when no extent was given at all — for
+/// tools where it's optional.
+pub(crate) fn optional_bbox(extent: &ExtentArgs) -> Result<Option<[f64; 4]>, McpError> {
+    let given = [extent.lon, extent.lat, extent.min_lon, extent.min_lat, extent.max_lon, extent.max_lat];
+    if given.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    let bbox = build_bbox(extent)?;
+    let parts: Vec<f64> = bbox.split(',').filter_map(|s| s.parse().ok()).collect();
+    Ok(<[f64; 4]>::try_from(parts).ok())
+}
+
+/// The centre `(lon, lat)` of a `build_bbox` string.
+pub(crate) fn centre_of(bbox: &str) -> Option<(f64, f64)> {
+    let n: Vec<f64> = bbox.split(',').filter_map(|s| s.parse().ok()).collect();
+    let [min_lon, min_lat, max_lon, max_lat] = n[..] else { return None };
+    Some(((min_lon + max_lon) / 2.0, (min_lat + max_lat) / 2.0))
+}
+
 /// Metres per degree of latitude, and of longitude at the equator.
 const METRES_PER_DEGREE: f64 = 111_320.0;
 
@@ -129,6 +149,23 @@ mod tests {
         let width = width_m(&req(None, None, Some(-118.2), Some(52.8), Some(-117.9), Some(52.95))).unwrap();
         assert!((width - 20_150.0).abs() < 200.0, "{width}");
         assert_eq!(width_m(&req(Some(1.0), Some(2.0), None, None, None, None)), None);
+    }
+
+    #[test]
+    fn an_optional_extent_can_be_left_out() {
+        assert_eq!(optional_bbox(&req(None, None, None, None, None, None)).unwrap(), None);
+        assert_eq!(
+            optional_bbox(&req(None, None, Some(1.0), Some(2.0), Some(3.0), Some(4.0))).unwrap(),
+            Some([1.0, 2.0, 3.0, 4.0])
+        );
+        assert!(optional_bbox(&req(Some(1.0), None, None, None, None, None)).is_err());
+    }
+
+    #[test]
+    fn centre_of_a_bbox_is_its_midpoint() {
+        let (lon, lat) = centre_of("-118.2,52.8,-118,53").unwrap();
+        assert!((lon + 118.1).abs() < 1e-9 && (lat - 52.9).abs() < 1e-9);
+        assert!(centre_of("1,2,3").is_none());
     }
 
     #[test]

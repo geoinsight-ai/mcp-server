@@ -94,21 +94,28 @@ pub(crate) struct Levels {
 /// - but never finer than the data, where children would only repeat the
 ///   same pixel; parents then move up to stay that depth above.
 ///
+/// With `data_first` (live imagery, see `map_request_limit`), children sit
+/// at the data's own level whatever the place's size: the backend mosaics
+/// such data on the spot, and a parent sized to a large place reads every
+/// band over far more pixels (all of Sentinel-2 over a level-5 parent ran
+/// past the gateway's ~50 s; a level-7 one is 1/49 of that area). The map
+/// then shows fewer, smaller parents around the centre of the place.
+///
 /// `children_override` is the caller's own `zone_level`, when given.
 pub(crate) fn choose_levels(
     grid: &Grid,
     place_width_m: Option<f64>,
     finest_gsd_m: Option<f64>,
     children_override: Option<u32>,
+    data_first: bool,
 ) -> Levels {
     let place = grid.finest_level_at_least(place_width_m.unwrap_or(POINT_PLACE_M));
     let data = finest_gsd_m
         .filter(|gsd| *gsd > 0.0)
         .map_or(grid.max_level, |gsd| grid.finest_level_at_least(gsd));
 
-    let children = children_override
-        .unwrap_or_else(|| (place + grid.default_depth).min(data))
-        .min(grid.max_level);
+    let by_place = || if data_first { data } else { (place + grid.default_depth).min(data) };
+    let children = children_override.unwrap_or_else(by_place).min(grid.max_level);
     let answer = match place_width_m {
         None => children,
         Some(_) => (place + ANSWER_EXTRA_LEVELS).min(children),
@@ -157,7 +164,7 @@ mod tests {
         // ~3 km town, 10 m pixels: level 7 (~7.9 km) spans it, so the place
         // alone would allow children at 13 (~23 m); 14 (~8.7 m) would be
         // finer than a pixel, so 13 is also the data's limit.
-        let levels = choose_levels(&ivea7h(), Some(3_000.0), Some(10.0), None);
+        let levels = choose_levels(&ivea7h(), Some(3_000.0), Some(10.0), None, false);
         assert_eq!(levels, Levels { parent: 7, children: 13, answer: 9, request_depth: None });
     }
 
@@ -165,20 +172,20 @@ mod tests {
     fn coarse_data_pulls_the_children_and_parents_up() {
         // Same town, 1 km model output: children stop at level 9 (~1.1 km)
         // and parents move up to stay six levels above them.
-        let levels = choose_levels(&ivea7h(), Some(3_000.0), Some(1_000.0), None);
+        let levels = choose_levels(&ivea7h(), Some(3_000.0), Some(1_000.0), None, false);
         assert_eq!(levels, Levels { parent: 3, children: 9, answer: 9, request_depth: None });
     }
 
     #[test]
     fn a_large_vector_area_follows_the_place_size() {
         // ~100 km park, no pixel size: level 4 spans it, children 6 below.
-        let levels = choose_levels(&ivea7h(), Some(100_000.0), None, None);
+        let levels = choose_levels(&ivea7h(), Some(100_000.0), None, None, false);
         assert_eq!(levels, Levels { parent: 4, children: 10, answer: 6, request_depth: None });
     }
 
     #[test]
     fn a_point_answers_at_the_drawn_level() {
-        let levels = choose_levels(&ivea7h(), None, Some(16.0), None);
+        let levels = choose_levels(&ivea7h(), None, Some(16.0), None, false);
         assert_eq!(levels.children, 13);
         assert_eq!(levels.answer, levels.children);
         assert_eq!(levels.parent, 7);
@@ -186,13 +193,23 @@ mod tests {
 
     #[test]
     fn the_callers_level_wins_and_shallow_levels_send_their_depth() {
-        let levels = choose_levels(&ivea7h(), Some(3_000.0), Some(10.0), Some(4));
+        let levels = choose_levels(&ivea7h(), Some(3_000.0), Some(10.0), Some(4), false);
         assert_eq!(levels, Levels { parent: 0, children: 4, answer: 4, request_depth: Some(4) });
     }
 
     #[test]
+    fn live_imagery_is_drawn_at_its_own_resolution() {
+        // Jasper's ~28 km bbox would put parents at level 5 by place; 10 m
+        // imagery goes to its native level 13 instead, parents at 7.
+        let levels = choose_levels(&ivea7h(), Some(28_000.0), Some(10.0), None, true);
+        assert_eq!((levels.parent, levels.children, levels.answer), (7, 13, 7));
+        let by_place = choose_levels(&ivea7h(), Some(28_000.0), Some(10.0), None, false);
+        assert_eq!((by_place.parent, by_place.children), (5, 11));
+    }
+
+    #[test]
     fn a_continent_sized_place_starts_at_level_zero() {
-        let levels = choose_levels(&ivea7h(), Some(20_000_000.0), None, None);
+        let levels = choose_levels(&ivea7h(), Some(20_000_000.0), None, None, false);
         assert_eq!((levels.parent, levels.children), (0, 6));
     }
 }
