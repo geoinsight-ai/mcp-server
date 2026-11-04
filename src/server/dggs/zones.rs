@@ -11,6 +11,16 @@ pub(crate) struct ParentZones {
     pub(crate) limit: usize,
 }
 
+/// `/collections/{id}/dggs/{dggrs}/zones` for a collection's zones, or the
+/// grid's own `/dggs/{dggrs}/zones` when there's no collection (grid
+/// navigation, which reads no data).
+fn zones_path(collection_id: Option<&str>, dggrs_id: &str) -> String {
+    match collection_id {
+        Some(id) => format!("/collections/{}/dggs/{}/zones", enc(id), enc(dggrs_id)),
+        None => format!("/dggs/{}/zones", enc(dggrs_id)),
+    }
+}
+
 /// DGGRS ids to prefer, in order, when a collection supports several and the
 /// caller didn't pin one. See `default_dggrs`.
 const PREFERRED_DGGRS: &[&str] = &["IVEA7H"];
@@ -60,10 +70,11 @@ impl DggsServer {
     }
 
     /// Zones covering the extent at `zone_level`: the one containing a point,
-    /// or every zone intersecting a bbox.
+    /// or every zone intersecting a bbox. Within a collection's grid, or the
+    /// grid alone when `collection_id` is `None`.
     pub(crate) async fn extent_zone_ids(
         &self,
-        collection_id: &str,
+        collection_id: Option<&str>,
         dggrs_id: &str,
         extent: &ExtentArgs,
         bbox: &str,
@@ -95,7 +106,7 @@ impl DggsServer {
     ) -> Result<ParentZones, McpError> {
         let bbox = build_bbox(extent)?;
         let mut ids = self
-            .extent_zone_ids(collection_id, dggrs_id, extent, &bbox, zone_level, caller_token)
+            .extent_zone_ids(Some(collection_id), dggrs_id, extent, &bbox, zone_level, caller_token)
             .await?;
         if ids.len() <= limit {
             return Ok(ParentZones { ids, limit });
@@ -126,7 +137,7 @@ impl DggsServer {
         zone_level: u32,
         caller_token: Option<&str>,
     ) -> Result<Vec<(String, (f64, f64))>, McpError> {
-        let path = format!("/collections/{}/dggs/{}/zones", enc(collection_id), enc(dggrs_id));
+        let path = zones_path(Some(collection_id), dggrs_id);
         let query = vec![
             ("bbox", bbox.to_string()),
             ("zone-level", zone_level.to_string()),
@@ -147,17 +158,13 @@ impl DggsServer {
     /// Zone ids at `zone_level` intersecting `bbox`, within a collection's grid.
     pub(crate) async fn list_zone_ids(
         &self,
-        collection_id: &str,
+        collection_id: Option<&str>,
         dggrs_id: &str,
         bbox: &str,
         zone_level: u32,
         caller_token: Option<&str>,
     ) -> Result<Vec<String>, McpError> {
-        let path = format!(
-            "/collections/{}/dggs/{}/zones",
-            enc(collection_id),
-            enc(dggrs_id)
-        );
+        let path = zones_path(collection_id, dggrs_id);
         let query = vec![
             ("bbox", bbox.to_string()),
             ("zone-level", zone_level.to_string()),
@@ -181,18 +188,14 @@ impl DggsServer {
     /// (a point exactly on a shared edge).
     pub(crate) async fn point_zone_ids(
         &self,
-        collection_id: &str,
+        collection_id: Option<&str>,
         dggrs_id: &str,
         bbox: &str,
         zone_level: u32,
         (lon, lat): (f64, f64),
         caller_token: Option<&str>,
     ) -> Result<Vec<String>, McpError> {
-        let path = format!(
-            "/collections/{}/dggs/{}/zones",
-            enc(collection_id),
-            enc(dggrs_id)
-        );
+        let path = zones_path(collection_id, dggrs_id);
         let query = vec![
             ("bbox", bbox.to_string()),
             ("zone-level", zone_level.to_string()),

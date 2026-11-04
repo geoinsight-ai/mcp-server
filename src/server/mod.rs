@@ -3,7 +3,8 @@
 //! - `tools/`: what MCP clients see, one file per group of tools —
 //!   `insights` (`list_insights`, `get_insight`), `collections`
 //!   (`list_collections`, `get_collection`), `data` (`get_data`, with its
-//!   output shaping in `data/rows` and `data/parquet`), `stats`
+//!   output shaping in `data/rows` and `data/parquet`), `grid` (`get_zone`,
+//!   `list_zones`: grid navigation without data), `stats`
 //!   (`get_call_stats`). Each keeps the helper methods only it uses.
 //! - `dggs/`: internal, shared by the tools — `extent` (point/bbox
 //!   arguments), `zones` (grid, depth and zone lookups), `aggregate`
@@ -131,7 +132,7 @@ impl DggsServer {
     }
 
     fn data_tools() -> ToolRouter<Self> {
-        Self::insights_router() + Self::collections_router() + Self::data_router()
+        Self::insights_router() + Self::collections_router() + Self::data_router() + Self::grid_router()
     }
 }
 
@@ -146,7 +147,9 @@ impl ServerHandler for DggsServer {
              collection(s)/field(s) you want instead of a named insight, use get_data \
              (optionally joining fields from several collections in one call) for the raw, \
              unaggregated per-zone values; list_collections(the place's lon/lat or bbox) \
-             finds the collections with data there, and get_collection their fields. In stdio mode, list_insights and \
+             finds the collections with data there, and get_collection their fields. list_zones \
+             and get_zone move around the DGGS grid itself (the zones covering a place, a \
+             zone's parent, children and neighbours) without reading any data. In stdio mode, list_insights and \
              get_insight need this server's own Auth0 client-credentials configured (they call \
              the bearer-token-gated /concepts route); get_data, list_collections and \
              get_collection work without it. In HTTP mode, every request needs its own bearer \
@@ -201,7 +204,7 @@ mod tests {
 
         assert!(stdio.tool_router.has_route("get_call_stats"));
         assert!(!http.tool_router.has_route("get_call_stats"));
-        for tool in ["list_insights", "get_insight", "get_data", "list_collections", "get_collection"] {
+        for tool in ["list_insights", "get_insight", "get_data", "list_collections", "get_collection", "get_zone", "list_zones"] {
             assert!(stdio.tool_router.has_route(tool) && http.tool_router.has_route(tool), "{tool}");
         }
     }

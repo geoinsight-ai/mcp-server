@@ -182,7 +182,7 @@ impl DggsServer {
         // A point resolves to the one zone containing it, not the 2-3
         // neighbours its small search box overlaps (see `extent_zone_ids`).
         let zone_ids = self
-            .extent_zone_ids(&collection_id, &dggrs_id, &req.extent, &bbox, levels.answer, caller_token)
+            .extent_zone_ids(Some(&collection_id), &dggrs_id, &req.extent, &bbox, levels.answer, caller_token)
             .await?;
         if zone_ids.is_empty() {
             return Err(McpError::invalid_params(
