@@ -138,7 +138,7 @@ impl DggsServer {
         // any.
         let anchor = &collections[0].collection_id;
         let zone_ids = self
-            .extent_zone_ids(anchor, &dggrs_id, &req.extent, &bbox, levels.answer, caller_token)
+            .extent_zone_ids(Some(anchor), &dggrs_id, &req.extent, &bbox, levels.answer, caller_token)
             .await?;
         if zone_ids.is_empty() {
             return Err(McpError::invalid_params(

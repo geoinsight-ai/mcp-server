@@ -59,6 +59,26 @@ impl Grid {
             .find(|&level| self.zone_width_m(level) >= width_m)
             .unwrap_or(0)
     }
+
+    /// The level of a place `place_width_m` wide (`None` for a point): the
+    /// finest whose zones still span it, as `choose_levels` starts from.
+    pub(crate) fn place_level(&self, place_width_m: Option<f64>) -> u32 {
+        self.finest_level_at_least(place_width_m.unwrap_or(POINT_PLACE_M))
+    }
+
+    /// The level whose zones are closest in area to `area_m2`. Zone info
+    /// doesn't say its level; on an equal-area grid the area gives it away
+    /// (each level is `aperture` times smaller). Only an estimate on grids
+    /// that don't follow `zone_width_m`'s count, like H3.
+    pub(crate) fn level_for_area(&self, area_m2: f64) -> u32 {
+        let width = area_m2.max(0.0).sqrt();
+        (0..=self.max_level)
+            .min_by(|&a, &b| {
+                let off = |level: u32| (self.zone_width_m(level) / width).ln().abs();
+                off(a).total_cmp(&off(b))
+            })
+            .unwrap_or(0)
+    }
 }
 
 /// The aperture written into a grid id: the digit right before its first
@@ -157,6 +177,15 @@ mod tests {
         assert!((grid.zone_width_m(6) - 20_800.0).abs() < 300.0);
         assert!((grid.zone_width_m(9) - 1_123.0).abs() < 20.0);
         assert!((grid.zone_width_m(12) - 61.0).abs() < 2.0);
+    }
+
+    #[test]
+    fn a_zones_level_comes_from_its_area() {
+        // H0-D99F-F, an IVEA7H level-7 zone, is 61.9 km².
+        assert_eq!(ivea7h().level_for_area(61_935_517.9), 7);
+        assert_eq!(ivea7h().level_for_area(1_260_000.0), 9);
+        assert_eq!(ivea7h().place_level(None), 9);
+        assert_eq!(ivea7h().place_level(Some(28_000.0)), 5);
     }
 
     #[test]
