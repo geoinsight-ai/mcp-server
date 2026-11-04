@@ -9,13 +9,14 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::collections::{finest_gsd, queryable_field_names};
+use crate::server::dggs::datetime::{api_datetime, time_query};
 use crate::server::dggs::extent::{ExtentArgs, build_bbox, width_m};
 use crate::server::dggs::level::choose_levels;
-use self::parquet::failed_everywhere;
-pub(super) use self::parquet::add_map_requests;
+use self::parquet::{failed_everywhere, is_plain};
+pub(super) use self::parquet::{add_map_requests, is_live_imagery, map_request_limit};
 use self::rows::{flatten_zone_data, summarize};
 use crate::server::dggs::zones::sample_evenly;
-use crate::server::{DggsServer, MAX_ZONES_PER_QUERY, bounded, caller_bearer_token, enc, pretty, zone_error};
+use crate::server::{DggsServer, MAX_ZONES_PER_QUERY, bounded, caller_bearer_token, enc, no_data_error, pretty, zone_error};
 
 /// `get_data` returns one row per zone up to this many matched zones; above
 /// it, a per-field summary instead, so the model's context stays small.
@@ -25,13 +26,18 @@ const MAX_ROWS: usize = 20;
 pub(super) struct CollectionSelectionInput {
     #[schemars(description = "Collection id to read from, as returned by list_collections.")]
     pub(super) collection_id: String,
-    #[schemars(description = "Fields to return from this collection, as listed under `fields` by get_collection. Omit to return every field of the collection.")]
+    #[schemars(description = "Fields to return from this collection, as listed under `fields` by get_collection. Omit to return every field of the collection — do that for imagery unless the user names specific bands, so the map offers all of them.")]
     #[serde(default)]
     pub(super) fields: Vec<String>,
     #[schemars(description = "Rename this collection's output column prefix (columns come back named \"prefix__field\"). Needed to select the same collection twice under different filters.")]
     pub(super) alias: Option<String>,
     #[schemars(description = "CQL2-text predicate restricting which of this collection's source rows contribute, e.g. \"length > 500\". Only supported for DuckDB-backed collections.")]
     pub(super) filter: Option<String>,
+    /// Set when `fields` was omitted and filled with every field: the map's
+    /// requests then ask for all of them rather than listing each one.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(super) all_fields: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -48,7 +54,7 @@ struct GetDataRequest {
     zone_level: Option<u32>,
     #[schemars(description = "Relative depth(s) below the resolved zone to expand into, for finer-than-zone_level detail within it: a single value \"5\", a range \"1-8\", or a list \"1,3,7\". Omit for one value per zone (zone-depth=0) — this can return a lot of data if set too deep.")]
     zone_depth: Option<String>,
-    #[schemars(description = "RFC 3339 instant or interval to filter temporal data (e.g. satellite imagery).")]
+    #[schemars(description = "Instant or interval to filter temporal data (e.g. satellite imagery), RFC 3339 like \"2024-08-01T00:00:00Z/2024-08-31T23:59:59Z\"; bare dates (\"2024-08-01/2024-08-31\") cover whole days. Pass the dates the user asked for; omit for none.")]
     datetime: Option<String>,
 }
 
@@ -85,6 +91,8 @@ impl DggsServer {
         }
 
         let bbox = build_bbox(&req.extent)?;
+        let datetime = req.datetime.as_deref().map(api_datetime).transpose()?;
+        let datetime = datetime.as_deref();
 
         // Every collection's queryables schema: the backend has no "all
         // fields" wildcard, so a collection with no `fields` gets every
@@ -98,6 +106,7 @@ impl DggsServer {
         for (c, props) in collections.iter_mut().zip(&schemas) {
             if c.fields.is_empty() {
                 c.fields = queryable_field_names(props);
+                c.all_fields = true;
             }
             if c.fields.is_empty() {
                 return Err(McpError::invalid_params(
@@ -120,7 +129,8 @@ impl DggsServer {
             }
         };
         let grid = self.grid(&dggrs_id, caller_token).await;
-        let levels = choose_levels(&grid, width_m(&req.extent), finest, req.zone_level);
+        let live_imagery = is_live_imagery(datetime, finest);
+        let levels = choose_levels(&grid, width_m(&req.extent), finest, req.zone_level, live_imagery);
 
         // DGGS zones are collection-independent (they depend only on the
         // DGGRS, the level and the extent), so any one of the requested
@@ -140,7 +150,8 @@ impl DggsServer {
         let as_rows = zones_matched <= MAX_ROWS;
         let zone_ids = sample_evenly(zone_ids, MAX_ZONES_PER_QUERY);
 
-        let parent_ids = self.extent_zone_ids(anchor, &dggrs_id, &req.extent, &bbox, levels.parent, caller_token);
+        let map_limit = map_request_limit(live_imagery);
+        let parents = self.map_parent_ids(anchor, &dggrs_id, &req.extent, levels.parent, map_limit, caller_token);
 
         let fetches = bounded(zone_ids.iter().map(|zone_id| {
             self.zone_row(
@@ -148,12 +159,12 @@ impl DggsServer {
                 zone_id,
                 &collections,
                 req.zone_depth.as_deref(),
-                req.datetime.as_deref(),
+                datetime,
                 caller_token,
             )
         }));
-        let (fetched, parent_ids) = futures::join!(fetches, parent_ids);
-        let parent_ids = parent_ids?;
+        let (fetched, parents) = futures::join!(fetches, parents);
+        let parents = parents?;
 
         let mut rows = Vec::new();
         let mut errors = Vec::new();
@@ -163,10 +174,7 @@ impl DggsServer {
         }
 
         if rows.is_empty() {
-            return Err(McpError::invalid_params(
-                "no data for any sampled zone; see `errors` for each failure",
-                Some(serde_json::json!({ "errors": errors })),
-            ));
+            return Err(no_data_error(errors));
         }
 
         let excluded = failed_everywhere(&collections, &errors, zone_ids.len());
@@ -192,9 +200,9 @@ impl DggsServer {
             self.client.public_base_url(),
             &dggrs_id,
             &levels,
-            &parent_ids,
+            &parents,
             &request_collections,
-            req.datetime.as_deref(),
+            datetime,
         );
         if !excluded.is_empty() {
             result["excluded_collections"] = serde_json::json!(excluded);
@@ -221,18 +229,60 @@ impl DggsServer {
     ) -> Result<Value, McpError> {
         let path = format!("/dggs/{}/zones/{}/data", enc(dggrs_id), enc(zone_id));
         let mut query = vec![("zone-depth", zone_depth.unwrap_or("0").to_string())];
-        if let Some(dt) = datetime {
-            query.push(("datetime", dt.to_string()));
-        }
+        query.extend(time_query(datetime));
         self.client.post_json(&path, &query, body, caller_token).await
+    }
+
+    /// One collection's row at one zone, columns named `prefix__field` as
+    /// the cross-collection POST names them. A plain selection (no alias or
+    /// filter) goes through the per-collection GET instead, which is the
+    /// only endpoint that accepts ids like `sentinel-2-l2a` (the POST
+    /// rejects hyphens with 422); its columns come back bare and are
+    /// prefixed here.
+    async fn collection_row(
+        &self,
+        dggrs_id: &str,
+        zone_id: &str,
+        collection: &CollectionSelectionInput,
+        zone_depth: Option<&str>,
+        datetime: Option<&str>,
+        caller_token: Option<&str>,
+    ) -> Result<serde_json::Map<String, Value>, McpError> {
+        if !is_plain(collection) {
+            let body = collections_body(std::slice::from_ref(collection));
+            let body = self
+                .cross_collection_data(dggrs_id, zone_id, &body, zone_depth, datetime, caller_token)
+                .await?;
+            return Ok(flatten_zone_data(zone_id, &body));
+        }
+        let path = format!(
+            "/collections/{}/dggs/{}/zones/{}/data",
+            enc(&collection.collection_id),
+            enc(dggrs_id),
+            enc(zone_id)
+        );
+        let mut query = vec![
+            ("zone-depth", zone_depth.unwrap_or("0").to_string()),
+            ("properties", collection.fields.join(",")),
+        ];
+        query.extend(time_query(datetime));
+        let body = self.client.get_json(&path, &query, caller_token).await?;
+        Ok(flatten_zone_data(zone_id, &body)
+            .into_iter()
+            .map(|(column, value)| match column.as_str() {
+                "zone_id" => (column, value),
+                field => (format!("{}__{field}", collection.collection_id), value),
+            })
+            .collect())
     }
 
     /// One zone's joined row for `get_data`. A single collection with no
     /// data at this zone fails the whole cross-collection POST (the backend
-    /// 500s with e.g. "Bbox of zones does not overlap COG extent"), which
-    /// would also throw away every other collection's values. So on failure
-    /// with several collections, retry each one alone and keep what
-    /// succeeds; only the collections that really failed are reported.
+    /// 500s with e.g. "Bbox of zones does not overlap COG extent"), as does
+    /// one the POST can't name (`sentinel-2-l2a`), which would also throw
+    /// away every other collection's values. So on failure with several
+    /// collections, read each one alone and keep what succeeds; only the
+    /// collections that really failed are reported.
     async fn zone_row(
         &self,
         dggrs_id: &str,
@@ -242,28 +292,27 @@ impl DggsServer {
         datetime: Option<&str>,
         caller_token: Option<&str>,
     ) -> (Option<serde_json::Map<String, Value>>, Vec<Value>) {
+        if let [only] = collections {
+            return match self.collection_row(dggrs_id, zone_id, only, zone_depth, datetime, caller_token).await {
+                Ok(row) => (Some(row), Vec::new()),
+                Err(err) => (None, vec![zone_error(zone_id, Some(&only.collection_id), &err)]),
+            };
+        }
         let joined = self
             .cross_collection_data(dggrs_id, zone_id, &collections_body(collections), zone_depth, datetime, caller_token)
             .await;
-        let err = match joined {
-            Ok(body) => return (Some(flatten_zone_data(zone_id, &body)), Vec::new()),
-            Err(err) => err,
-        };
-        if collections.len() == 1 {
-            return (None, vec![zone_error(zone_id, Some(&collections[0].collection_id), &err)]);
+        if let Ok(body) = joined {
+            return (Some(flatten_zone_data(zone_id, &body)), Vec::new());
         }
 
         let mut row: Option<serde_json::Map<String, Value>> = None;
         let mut errors = Vec::new();
         for collection in collections {
-            let body = collections_body(std::slice::from_ref(collection));
             match self
-                .cross_collection_data(dggrs_id, zone_id, &body, zone_depth, datetime, caller_token)
+                .collection_row(dggrs_id, zone_id, collection, zone_depth, datetime, caller_token)
                 .await
             {
-                Ok(body) => row
-                    .get_or_insert_with(serde_json::Map::new)
-                    .extend(flatten_zone_data(zone_id, &body)),
+                Ok(values) => row.get_or_insert_with(serde_json::Map::new).extend(values),
                 Err(err) => errors.push(zone_error(zone_id, Some(&collection.collection_id), &err)),
             }
         }

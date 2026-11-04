@@ -8,12 +8,13 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::collections::{finest_gsd, queryable_field_names};
-use super::data::{CollectionSelectionInput, add_map_requests};
+use super::data::{CollectionSelectionInput, add_map_requests, is_live_imagery, map_request_limit};
 use crate::server::dggs::aggregate::{majority, reduce};
+use crate::server::dggs::datetime::{api_datetime, time_query};
 use crate::server::dggs::extent::{ExtentArgs, build_bbox, width_m};
 use crate::server::dggs::level::choose_levels;
 use crate::server::dggs::zones::sample_evenly;
-use crate::server::{DggsServer, MAX_ZONES_PER_QUERY, bounded, caller_bearer_token, enc, pretty, zone_error};
+use crate::server::{DggsServer, MAX_ZONES_PER_QUERY, bounded, caller_bearer_token, enc, no_data_error, pretty, zone_error};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct GetInsightRequest {
@@ -29,7 +30,7 @@ struct GetInsightRequest {
     dggrs_id: Option<String>,
     #[schemars(description = "DGGS zone level the map draws. Omit it (the usual case) to have it chosen from the size of the place and the resolution of the insight's data; set it only to force coarser or finer detail.")]
     zone_level: Option<u32>,
-    #[schemars(description = "RFC 3339 instant or interval to filter temporal data (e.g. satellite imagery), such as \"2024-06-01T00:00:00Z\" or \"2024-06-01T00:00:00Z/2024-06-30T23:59:59Z\".")]
+    #[schemars(description = "Instant or interval to filter temporal data (e.g. satellite imagery), RFC 3339 such as \"2024-06-01T00:00:00Z\" or \"2024-06-01T00:00:00Z/2024-06-30T23:59:59Z\"; bare dates (\"2024-06-01/2024-06-30\") cover whole days. Pass the dates the user asked for; omit for none.")]
     datetime: Option<String>,
 }
 
@@ -159,6 +160,8 @@ impl DggsServer {
             None => self.default_dggrs(&collection_id, caller_token).await?,
         };
         let bbox = build_bbox(&req.extent)?;
+        let datetime = req.datetime.as_deref().map(api_datetime).transpose()?;
+        let datetime = datetime.as_deref();
 
         let (props, grid) = futures::join!(
             self.queryables(&collection_id, caller_token),
@@ -171,7 +174,10 @@ impl DggsServer {
             fields if fields.is_empty() => queryable_field_names(&props),
             fields => fields,
         };
-        let levels = choose_levels(&grid, width_m(&req.extent), finest_gsd(&props, &fields), req.zone_level);
+        let finest = finest_gsd(&props, &fields);
+        let live_imagery = is_live_imagery(datetime, finest);
+        let levels = choose_levels(&grid, width_m(&req.extent), finest, req.zone_level, live_imagery);
+        let map_limit = map_request_limit(live_imagery);
 
         // A point resolves to the one zone containing it, not the 2-3
         // neighbours its small search box overlaps (see `extent_zone_ids`).
@@ -194,12 +200,12 @@ impl DggsServer {
         let fetches = bounded(
             zone_ids
                 .iter()
-                .map(|zone_id| self.zone_values(&collection_id, &dggrs_id, zone_id, req.datetime.as_deref(), caller_token)),
+                .map(|zone_id| self.zone_values(&collection_id, &dggrs_id, zone_id, datetime, caller_token)),
         );
-        let parent_ids =
-            self.extent_zone_ids(&collection_id, &dggrs_id, &req.extent, &bbox, levels.parent, caller_token);
-        let (results, parent_ids) = futures::join!(fetches, parent_ids);
-        let parent_ids = parent_ids?;
+        let parents =
+            self.map_parent_ids(&collection_id, &dggrs_id, &req.extent, levels.parent, map_limit, caller_token);
+        let (results, parents) = futures::join!(fetches, parents);
+        let parents = parents?;
 
         // Each property is collected raw first, then reduced according to
         // its own type: numeric properties average/sum/min/max per
@@ -209,10 +215,7 @@ impl DggsServer {
         // the whole answer; only if every zone fails is the call an error.
         let (mut per_property, errors) = collect_zone_values(&zone_ids, results, &collection_id);
         if errors.len() == zone_ids.len() {
-            return Err(McpError::invalid_params(
-                "no data for any sampled zone; see `errors` for each failure",
-                Some(serde_json::json!({ "errors": errors })),
-            ));
+            return Err(no_data_error(errors));
         }
         per_property.retain(|property, _| fields.contains(property));
 
@@ -240,15 +243,16 @@ impl DggsServer {
             fields,
             alias: None,
             filter: None,
+            all_fields: false,
         }];
         add_map_requests(
             &mut result,
             self.client.public_base_url(),
             &dggrs_id,
             &levels,
-            &parent_ids,
+            &parents,
             &map_collections,
-            req.datetime.as_deref(),
+            datetime,
         );
         if !errors.is_empty() {
             result["errors"] = Value::Array(errors);
@@ -352,9 +356,7 @@ impl DggsServer {
             enc(zone_id)
         );
         let mut query = vec![("zone-depth", "0".to_string())];
-        if let Some(dt) = datetime {
-            query.push(("datetime", dt.to_string()));
-        }
+        query.extend(time_query(datetime));
         let body = self.client.get_json(&path, &query, caller_token).await?;
         let values = body
             .get("values")

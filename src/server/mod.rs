@@ -70,6 +70,21 @@ fn zone_error(zone_id: &str, collection_id: Option<&str>, err: &McpError) -> Val
     })
 }
 
+/// The error for a call where every sampled zone failed. Clients often show
+/// a model only an error's message, not its data, so the backend's reason
+/// (e.g. "invalid collection id") goes into the message itself; the
+/// per-zone failures stay in the data.
+fn no_data_error(errors: Vec<Value>) -> McpError {
+    let reason = errors
+        .iter()
+        .find_map(|e| e["hint"].as_str().or_else(|| e["message"].as_str()))
+        .unwrap_or("unknown error");
+    McpError::invalid_params(
+        format!("no data for any sampled zone ({} failed); first failure: {reason}", errors.len()),
+        Some(serde_json::json!({ "errors": errors })),
+    )
+}
+
 /// The caller's own bearer token, when this request arrived over the
 /// customer-facing HTTP transport (`src/http_transport.rs`) with a validated
 /// `Authorization` header. `None` on stdio — nothing ever inserts
@@ -130,8 +145,8 @@ impl ServerHandler for DggsServer {
              resolution and cross-zone aggregation internally. If you already know which \
              collection(s)/field(s) you want instead of a named insight, use get_data \
              (optionally joining fields from several collections in one call) for the raw, \
-             unaggregated per-zone values. list_collections/get_collection are a secondary \
-             path for browsing raw dataset metadata. In stdio mode, list_insights and \
+             unaggregated per-zone values; list_collections(the place's lon/lat or bbox) \
+             finds the collections with data there, and get_collection their fields. In stdio mode, list_insights and \
              get_insight need this server's own Auth0 client-credentials configured (they call \
              the bearer-token-gated /concepts route); get_data, list_collections and \
              get_collection work without it. In HTTP mode, every request needs its own bearer \

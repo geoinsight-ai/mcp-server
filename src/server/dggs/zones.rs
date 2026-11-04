@@ -1,9 +1,15 @@
 use rmcp::ErrorData as McpError;
 use serde_json::Value;
 
-use super::extent::{ExtentArgs, point_of};
+use super::extent::{ExtentArgs, build_bbox, centre_of, point_of};
 use super::level::Grid;
 use crate::server::{DggsServer, enc};
+
+/// The parent zones covering a place, and how many of them the map gets.
+pub(crate) struct ParentZones {
+    pub(crate) ids: Vec<String>,
+    pub(crate) limit: usize,
+}
 
 /// DGGRS ids to prefer, in order, when a collection supports several and the
 /// caller didn't pin one. See `default_dggrs`.
@@ -71,6 +77,71 @@ impl DggsServer {
             }
             None => self.list_zone_ids(collection_id, dggrs_id, bbox, zone_level, caller_token).await,
         }
+    }
+
+    /// The parent zones the map loads, for `extent_zone_ids`' extent at
+    /// `zone_level`. When there are more than `limit` (the map only gets that
+    /// many), they're ordered nearest the centre of the place first, so the
+    /// map shows where the user asked about rather than the first zones in
+    /// the API's id order (which skipped half of Jasper town).
+    pub(crate) async fn map_parent_ids(
+        &self,
+        collection_id: &str,
+        dggrs_id: &str,
+        extent: &ExtentArgs,
+        zone_level: u32,
+        limit: usize,
+        caller_token: Option<&str>,
+    ) -> Result<ParentZones, McpError> {
+        let bbox = build_bbox(extent)?;
+        let mut ids = self
+            .extent_zone_ids(collection_id, dggrs_id, extent, &bbox, zone_level, caller_token)
+            .await?;
+        if ids.len() <= limit {
+            return Ok(ParentZones { ids, limit });
+        }
+        let Some(centre) = centre_of(&bbox) else { return Ok(ParentZones { ids, limit }) };
+        // Only an ordering hint: if the polygons can't be read, the API's
+        // order stands.
+        if let Ok(centres) = self.zone_centres(collection_id, dggrs_id, &bbox, zone_level, caller_token).await {
+            let distance = |id: &String| {
+                centres
+                    .iter()
+                    .find(|(zone, _)| zone == id)
+                    .map_or(f64::INFINITY, |(_, c)| squared_distance(*c, centre))
+            };
+            ids.sort_by(|a, b| distance(a).total_cmp(&distance(b)));
+        }
+        Ok(ParentZones { ids, limit })
+    }
+
+    /// Each zone at `zone_level` intersecting `bbox` with the mean of its
+    /// polygon's vertices, close enough to its centre for ordering zones by
+    /// nearness.
+    async fn zone_centres(
+        &self,
+        collection_id: &str,
+        dggrs_id: &str,
+        bbox: &str,
+        zone_level: u32,
+        caller_token: Option<&str>,
+    ) -> Result<Vec<(String, (f64, f64))>, McpError> {
+        let path = format!("/collections/{}/dggs/{}/zones", enc(collection_id), enc(dggrs_id));
+        let query = vec![
+            ("bbox", bbox.to_string()),
+            ("zone-level", zone_level.to_string()),
+            ("f", "geojson".to_string()),
+        ];
+        let body = self.client.get_json(&path, &query, caller_token).await?;
+        let features = body.get("features").and_then(Value::as_array).cloned().unwrap_or_default();
+        Ok(features
+            .iter()
+            .filter_map(|f| {
+                let id = f.get("id")?.as_str()?.to_string();
+                let ring = f.pointer("/geometry/coordinates/0")?.as_array()?;
+                Some((id, ring_centre(ring)?))
+            })
+            .collect())
     }
 
     /// Zone ids at `zone_level` intersecting `bbox`, within a collection's grid.
@@ -147,6 +218,28 @@ impl DggsServer {
     }
 }
 
+/// The mean of a GeoJSON ring's vertices (the closing vertex repeats the
+/// first, which barely shifts it).
+fn ring_centre(ring: &[Value]) -> Option<(f64, f64)> {
+    let points: Vec<(f64, f64)> = ring
+        .iter()
+        .filter_map(|p| Some((p.get(0)?.as_f64()?, p.get(1)?.as_f64()?)))
+        .collect();
+    let n = points.len() as f64;
+    (n > 0.0).then(|| {
+        let (lon, lat) = points.iter().fold((0.0, 0.0), |(x, y), (px, py)| (x + px, y + py));
+        (lon / n, lat / n)
+    })
+}
+
+/// Squared distance between two lon/lat points, with longitude shrunk by
+/// latitude so east-west and north-south compare fairly. Only for ordering.
+fn squared_distance((lon_a, lat_a): (f64, f64), (lon_b, lat_b): (f64, f64)) -> f64 {
+    let shrink = ((lat_a + lat_b) / 2.0).to_radians().cos();
+    let (dx, dy) = ((lon_a - lon_b) * shrink, lat_a - lat_b);
+    dx * dx + dy * dy
+}
+
 /// Ray-casting point-in-polygon test against a GeoJSON linear ring
 /// (`[[lon, lat], ...]`). Ignores antimeridian wrap, which no zone this
 /// server samples at a point query's resolution straddles in practice.
@@ -179,6 +272,16 @@ pub(crate) fn sample_evenly(ids: Vec<String>, max: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nearer_zones_sort_first() {
+        let ring = serde_json::json!([[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]]);
+        assert_eq!(ring_centre(ring.as_array().unwrap()), Some((1.0, 1.0)));
+        // At 60°N a degree of longitude is half a degree of latitude.
+        let east = squared_distance((1.0, 60.0), (0.0, 60.0));
+        let north = squared_distance((0.0, 60.6), (0.0, 60.0));
+        assert!(east < north);
+    }
 
     #[test]
     fn ring_contains_distinguishes_inside_from_outside() {
