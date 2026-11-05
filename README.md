@@ -32,7 +32,7 @@ Given an insight (by name or id) and a location (`lon`/`lat`, or a
 
 1. Resolve the insight to a concept (`GET /concepts/{id}`), which carries which
    collection(s) serve it and the bands it reads from each
-   (`collections[].properties`, e.g. B8A and B12 for burn scars). Only those bands are
+   (`sources[].inputs`, e.g. B8A and B12 for burn scars). Only those bands are
    fetched and reported; a collection the concept doesn't list falls back to all fields.
 2. Find the DGGRS grid for that collection (`GET /collections/{id}/dggs`, preferring
    `IVEA7H` — see gotcha below — unless overridden).

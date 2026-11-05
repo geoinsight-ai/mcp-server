@@ -92,19 +92,19 @@ fn property_stats(props: &serde_json::Map<String, Value>) -> HashMap<String, (Op
         .collect()
 }
 
-/// The bands a concept reads from `collection_id` (`collections[].properties`
-/// in its detail), e.g. B8A and B12 for burn scars. Empty when the concept
-/// doesn't list that collection.
+/// The bands a concept reads from `collection_id` (the values of
+/// `sources[].inputs` in its detail), e.g. B8A and B12 for burn scars. Empty
+/// when the concept doesn't list that collection.
 fn concept_fields(concept: &Value, collection_id: &str) -> Vec<String> {
     concept
-        .get("collections")
+        .get("sources")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .find(|c| c.get("id").and_then(Value::as_str) == Some(collection_id))
-        .and_then(|c| c.get("properties"))
+        .find(|s| s.get("collection_id").and_then(Value::as_str) == Some(collection_id))
+        .and_then(|s| s.get("inputs"))
         .and_then(Value::as_object)
-        .map(|props| props.keys().cloned().collect())
+        .map(|inputs| inputs.values().filter_map(Value::as_str).map(str::to_string).collect())
         .unwrap_or_default()
 }
 
@@ -141,10 +141,10 @@ impl DggsServer {
         let collection_id = match &req.collection_id {
             Some(cid) => cid.clone(),
             None => concept
-                .get("collections")
+                .get("sources")
                 .and_then(Value::as_array)
-                .and_then(|c| c.first())
-                .and_then(|c| c.get("id"))
+                .and_then(|s| s.first())
+                .and_then(|s| s.get("collection_id"))
                 .and_then(Value::as_str)
                 .map(str::to_string)
                 .ok_or_else(|| {
@@ -294,13 +294,13 @@ impl DggsServer {
 
         let exact: Vec<&Value> = list
             .iter()
-            .filter(|c| field_eq(c, "name", &needle) || field_eq(c, "ui_label", &needle))
+            .filter(|c| field_eq(c, "name", &needle) || field_eq(c, "label", &needle))
             .collect();
         let candidates = if !exact.is_empty() {
             exact
         } else {
             list.iter()
-                .filter(|c| field_contains(c, "name", &needle) || field_contains(c, "ui_label", &needle))
+                .filter(|c| field_contains(c, "name", &needle) || field_contains(c, "label", &needle))
                 .collect()
         };
 
@@ -404,9 +404,9 @@ mod tests {
     #[test]
     fn concept_fields_are_the_bands_listed_for_that_collection() {
         let concept = serde_json::json!({
-            "collections": [
-                {"id": "sentinel-2-l2a", "properties": {"B8A_20m": {"gi_gsd": 20}, "B12_20m": {"gi_gsd": 20}}},
-                {"id": "other", "properties": {"x": {}}}
+            "sources": [
+                {"collection_id": "sentinel-2-l2a", "inputs": {"nir": "B8A_20m", "swir2": "B12_20m"}},
+                {"collection_id": "other", "inputs": {"x": "x"}}
             ]
         });
         let mut fields = concept_fields(&concept, "sentinel-2-l2a");
