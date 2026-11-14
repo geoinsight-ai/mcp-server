@@ -1,6 +1,7 @@
 use serde_json::Value;
 
 use super::{CollectionSelectionInput, collections_body};
+use crate::server::tools::derived::DerivedFields;
 use crate::server::dggs::datetime::time_query;
 use crate::server::dggs::level::Levels;
 use crate::server::dggs::zones::ParentZones;
@@ -36,6 +37,14 @@ pub(in crate::server::tools) fn map_request_limit(live_imagery: bool) -> usize {
     }
 }
 
+/// What a map request reads: the collections with their fields, and the
+/// derived fields the API calculates from them.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::server::tools) struct MapSelection<'a> {
+    pub(in crate::server::tools) collections: &'a [CollectionSelectionInput],
+    pub(in crate::server::tools) derived: &'a DerivedFields,
+}
+
 /// The map's share of a `get_data`/`get_insight` result, added to `result`:
 /// the levels it draws (`parent_level`, `children_level`), the collections
 /// it loads, and one Parquet request per parent zone, up to its limit. Both
@@ -46,14 +55,15 @@ pub(in crate::server::tools) fn add_map_requests(
     dggrs_id: &str,
     levels: &Levels,
     parents: &ParentZones,
-    collections: &[CollectionSelectionInput],
+    selection: MapSelection<'_>,
     datetime: Option<&str>,
 ) {
+    let collections = selection.collections;
     let requests: Vec<Value> = parents
         .ids
         .iter()
         .take(parents.limit)
-        .map(|parent| parquet_request(base_url, dggrs_id, parent, collections, datetime, levels.request_depth))
+        .map(|parent| parquet_request(base_url, dggrs_id, parent, selection, datetime, levels.request_depth))
         .collect();
 
     result["parent_level"] = serde_json::json!(levels.parent);
@@ -72,20 +82,24 @@ pub(in crate::server::tools) fn add_map_requests(
 /// endpoint rejects, like `sentinel-2-l2a`): with every field when the
 /// caller didn't pick any, so the map can switch between all the bands,
 /// otherwise just the picked ones. Anything else uses the cross-collection
-/// POST, so several collections come back as one combined view.
+/// POST, so several collections come back as one combined view. Derived
+/// fields are defined in the query of either request; on the GET their names
+/// join the picked fields in `properties`.
 fn parquet_request(
     base_url: &str,
     dggrs_id: &str,
     parent_zone_id: &str,
-    collections: &[CollectionSelectionInput],
+    selection: MapSelection<'_>,
     datetime: Option<&str>,
     zone_depth: Option<u32>,
 ) -> Value {
+    let MapSelection { collections, derived } = selection;
     let mut query = vec!["f=parquet".to_string()];
     query.extend(time_query(datetime).into_iter().map(|(k, v)| format!("{k}={}", enc(&v))));
     if let Some(depth) = zone_depth {
         query.push(format!("zone-depth={depth}"));
     }
+    query.extend(derived.url_parts());
     let query = query.join("&");
 
     match collections {
@@ -93,7 +107,8 @@ fn parquet_request(
             let properties = if only.all_fields {
                 String::new()
             } else {
-                format!("&properties={}", enc(&only.fields.join(",")))
+                let returned: Vec<String> = only.fields.iter().cloned().chain(derived.names()).collect();
+                format!("&properties={}", enc(&returned.join(",")))
             };
             serde_json::json!({
                 "parent_zone_id": parent_zone_id,
@@ -153,12 +168,36 @@ mod tests {
         }
     }
 
+    /// A selection of stored fields only.
+    fn stored(collections: &[CollectionSelectionInput]) -> MapSelection<'_> {
+        static NONE: DerivedFields = DerivedFields::none();
+        MapSelection { collections, derived: &NONE }
+    }
+
+    #[test]
+    fn a_derived_field_is_defined_in_the_query_and_listed_in_properties() {
+        // Arrange: no stored field picked, one calculated.
+        let derived = DerivedFields::new(vec![("ratio".to_string(), "b8 / b4".to_string())]);
+        let collections = [selection("sentinel-2-l2a", &[])];
+        let selection = MapSelection { collections: &collections, derived: &derived };
+
+        // Act
+        let l = parquet_request("https://api.example", "IVEA7H", "C0-1A", selection, None, None);
+
+        // Assert
+        assert_eq!(l["method"], "GET");
+        assert_eq!(
+            l["url"],
+            "https://api.example/collections/sentinel-2-l2a/dggs/IVEA7H/zones/C0-1A/data?f=parquet&alias%5Bratio%5D=b8%20%2F%20b4&properties=ratio"
+        );
+    }
+
     #[test]
     fn map_requests_carry_levels_collections_and_a_capped_request_list() {
         let levels = Levels { parent: 7, children: 13, answer: 9, request_depth: None };
         let parents = ParentZones { ids: (0..20).map(|i| format!("P{i}")).collect(), limit: MAX_PARQUET_REQUESTS };
         let mut result = serde_json::json!({});
-        add_map_requests(&mut result, "https://api.example", "IVEA7H", &levels, &parents, &[selection("sentinel-2-l2a", &["B04_10m"])], None);
+        add_map_requests(&mut result, "https://api.example", "IVEA7H", &levels, &parents, stored(&[selection("sentinel-2-l2a", &["B04_10m"])]), None);
 
         assert_eq!(result["parent_level"], 7);
         assert_eq!(result["children_level"], 13);
@@ -170,7 +209,7 @@ mod tests {
 
     #[test]
     fn single_collection_request_is_a_plain_get() {
-        let l = parquet_request("https://api.example", "IVEA7H", "C0-1A", &[selection("sentinel-2-l2a", &["B04"])], None, None);
+        let l = parquet_request("https://api.example", "IVEA7H", "C0-1A", stored(&[selection("sentinel-2-l2a", &["B04"])]), None, None);
         assert_eq!(l["method"], "GET");
         assert_eq!(
             l["url"],
@@ -179,7 +218,7 @@ mod tests {
         assert!(l.get("body").is_none());
 
         let all = CollectionSelectionInput { all_fields: true, ..selection("sentinel-2-l2a", &["B04", "B08"]) };
-        let l = parquet_request("https://api.example", "IVEA7H", "C0-1A", &[all], None, None);
+        let l = parquet_request("https://api.example", "IVEA7H", "C0-1A", stored(&[all]), None, None);
         assert_eq!(l["url"], "https://api.example/collections/sentinel-2-l2a/dggs/IVEA7H/zones/C0-1A/data?f=parquet");
     }
 
@@ -195,7 +234,7 @@ mod tests {
     #[test]
     fn several_collections_request_is_one_combined_post() {
         let cols = [selection("canada_dem", &["band1_mean"]), selection("overture_admin0", &["country_name"])];
-        let l = parquet_request("https://api.example", "IVEA7H", "C0-1A", &cols, Some("2024-06-01T00:00:00Z"), Some(4));
+        let l = parquet_request("https://api.example", "IVEA7H", "C0-1A", stored(&cols), Some("2024-06-01T00:00:00Z"), Some(4));
         assert_eq!(l["method"], "POST");
         assert_eq!(
             l["url"],

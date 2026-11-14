@@ -13,8 +13,9 @@ use crate::server::dggs::datetime::{api_datetime, time_query};
 use crate::server::dggs::extent::{ExtentArgs, build_bbox, width_m};
 use crate::server::dggs::level::choose_levels;
 use self::parquet::{failed_everywhere, is_plain};
-pub(super) use self::parquet::{add_map_requests, is_live_imagery, map_request_limit};
+pub(super) use self::parquet::{MapSelection, add_map_requests, is_live_imagery, map_request_limit};
 use self::rows::{flatten_zone_data, summarize};
+use super::derived::DerivedFields;
 use crate::server::dggs::zones::sample_evenly;
 use crate::server::{DggsServer, MAX_ZONES_PER_QUERY, bounded, caller_bearer_token, enc, no_data_error, pretty, zone_error};
 
@@ -201,7 +202,7 @@ impl DggsServer {
             &dggrs_id,
             &levels,
             &parents,
-            &request_collections,
+            MapSelection { collections: &request_collections, derived: &DerivedFields::none() },
             datetime,
         );
         if !excluded.is_empty() {

@@ -30,10 +30,13 @@ routes are deliberately **not** exposed as tools at all.
 Given an insight (by name or id) and a location (`lon`/`lat`, or a
 `min_lon`/`min_lat`/`max_lon`/`max_lat` box):
 
-1. Resolve the insight to a concept (`GET /concepts/{id}`), which carries which
-   collection(s) serve it and the bands it reads from each
-   (`sources[].inputs`, e.g. B8A and B12 for burn scars). Only those bands are
-   fetched and reported; a collection the concept doesn't list falls back to all fields.
+1. Resolve the insight to a concept (`GET /concepts/{id}`) by id, name, label or one
+   of its `aliases`. The concept carries which collection(s) serve it and, for each,
+   what it calculates there: `sources[].properties`, a name and an expression over the
+   collection's fields, e.g. `ndvi` and `(B08_10m - B04_10m) / (B08_10m + B04_10m - 2000)`.
+   A concept without an expression for the collection (e.g. burn scars, which run a
+   process) reports its input fields (`sources[].inputs`) instead; a collection the
+   concept doesn't list falls back to all fields.
 2. Find the DGGRS grid for that collection (`GET /collections/{id}/dggs`, preferring
    `IVEA7H` — see gotcha below — unless overridden).
 3. Choose the zone levels from the place and the data (see
@@ -43,20 +46,22 @@ Given an insight (by name or id) and a location (`lon`/`lat`, or a
    the 2-3 neighbours its small search box overlaps; an area to every zone it
    intersects, sampled **evenly** across the list if there are more than 64.
 4. Fetch each zone's own value (`GET .../zones/{id}/data?zone-depth=0`, one call per
-   zone, run concurrently). A zone that fails is listed under `errors` and left out of
+   zone, run concurrently). The concept's expression is sent unchanged as
+   `alias[name]=expression&properties=name`, so the API calculates the value for each
+   zone; this server never rewrites or evaluates a formula. A zone that fails is listed under `errors` and left out of
    the reduction; only if every zone fails is the call an error.
 5. Reduce each property across the sampled zones using **that property's own
-   configured statistic** (`gi_dggs_stat` from `GET /collections/{id}/queryables` — e.g.
-   `mean` for a numeric property like NDVI, `majority` for a categorical one like a
-   country name), not a hardcoded guess. Numeric properties support
+   configured statistic**: the concept's `output.stat` for the value it calculates,
+   `gi_dggs_stat` from `GET /collections/{id}/queryables` for a stored field (e.g.
+   `majority` for a categorical one like a country name), not a hardcoded guess. Numeric properties support
    `mean`/`sum`/`min`/`max`/`count`; anything non-numeric falls back to a majority vote
    across the sampled zones.
 
 The result is one JSON object: the insight, which collection/grid/resolution were used,
 how many zones were sampled, a `values` map of `{ value, stat, unit, sampled_zones }`
-per band, `errors` when some zones failed, and the same map fields as `get_data`
+per value, `errors` when some zones failed, and the same map fields as `get_data`
 (`parent_level`, `children_level`, `collections`, `parquet_requests`), so a map can draw
-the insight's bands over the whole place.
+the insight's value over the whole place.
 
 ### `get_data`: raw values for the model, Parquet requests for the map
 
