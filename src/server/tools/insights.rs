@@ -8,7 +8,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::collections::{finest_gsd, queryable_field_names};
-use super::data::{CollectionSelectionInput, add_map_requests, is_live_imagery, map_request_limit};
+use super::data::{CollectionSelectionInput, MapSelection, add_map_requests, is_live_imagery, map_request_limit};
+use super::derived::DerivedFields;
 use crate::server::dggs::aggregate::{majority, reduce};
 use crate::server::dggs::datetime::{api_datetime, time_query};
 use crate::server::dggs::extent::{ExtentArgs, build_bbox, width_m};
@@ -18,7 +19,7 @@ use crate::server::{DggsServer, MAX_ZONES_PER_QUERY, bounded, caller_bearer_toke
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct GetInsightRequest {
-    #[schemars(description = "Which insight/concept to compute, e.g. \"ndvi\", \"burn_scar_analysis\". Matches by numeric id or by name/label (case-insensitive). See list_insights for what's available.")]
+    #[schemars(description = "Which insight/concept to compute, e.g. \"ndvi\", \"burn_scar_analysis\". Matches by numeric id, by name/label (case-insensitive), or by one of the insight's other names (e.g. \"greenness\"). See list_insights for what's available.")]
     insight: String,
 
     #[serde(flatten)]
@@ -108,6 +109,60 @@ fn concept_fields(concept: &Value, collection_id: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The values a concept calculates on `collection_id`: the entries of
+/// `sources[].properties` in its detail, each a name and the expression the
+/// API evaluates for every zone. Empty when the concept has none for that
+/// collection, as for one that only runs a process.
+fn concept_properties(concept: &Value, collection_id: &str) -> DerivedFields {
+    let pairs = concept
+        .get("sources")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|s| s.get("collection_id").and_then(Value::as_str) == Some(collection_id))
+        .and_then(|s| s.get("properties"))
+        .and_then(Value::as_object)
+        .map(|properties| {
+            properties
+                .iter()
+                .filter_map(|(name, expression)| Some((name.clone(), expression.as_str()?.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    DerivedFields::new(pairs)
+}
+
+/// The statistic and unit a concept declares for `field`, when `field` is
+/// its output (`output.field`, `output.stat`, `output.unit`).
+fn concept_output_stat(concept: &Value, field: &str) -> Option<(Option<String>, Option<String>)> {
+    let output = concept.get("output")?;
+    if output.get("field").and_then(Value::as_str) != Some(field) {
+        return None;
+    }
+    let text = |key: &str| output.get(key).and_then(Value::as_str).map(str::to_string);
+    Some((text("stat"), text("unit")))
+}
+
+/// Whether a concept detail lists `name` among its `aliases` (letter case
+/// ignored).
+fn has_alias(concept: &Value, name: &str) -> bool {
+    concept
+        .get("aliases")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .any(|alias| alias.eq_ignore_ascii_case(name))
+}
+
+/// What one zone read asks for.
+struct ZoneRead<'a> {
+    collection_id: &'a str,
+    dggrs_id: &'a str,
+    datetime: Option<&'a str>,
+    derived: &'a DerivedFields,
+}
+
 #[tool_router(router = insights_router, vis = "pub(crate)")]
 impl DggsServer {
     #[tool(
@@ -120,7 +175,7 @@ impl DggsServer {
     }
 
     #[tool(
-        description = "Get an insight's value for a location or area — the main data-access tool. Pass an insight (e.g. \"ndvi\", \"burn_scar_analysis\"; see list_insights) and either a point (lon/lat) or an area (min_lon/min_lat/max_lon/max_lat). This resolves the insight's data source and the bands it reads, picks DGGS zone levels from the size of the place and the data's resolution, samples the zone(s) covering the location (the single zone containing a point; up to 64 zones spread evenly across an area), and returns one aggregated value per band using that band's own configured statistic (mean, max, ...) — you get a location, not a list of DGGS zones to interpret yourself. It also returns `parquet_requests` for a map to draw the insight's data over the whole place itself; that data never passes through you. Zones that fail are listed under `errors`; the value comes from the zones that succeeded."
+        description = "Get an insight's value for a location or area — the main data-access tool. Pass an insight (e.g. \"ndvi\", \"burn_scar_analysis\"; see list_insights) and either a point (lon/lat) or an area (min_lon/min_lat/max_lon/max_lat). This resolves the insight's data source, picks DGGS zone levels from the size of the place and the data's resolution, samples the zone(s) covering the location (the single zone containing a point; up to 64 zones spread evenly across an area), and returns the insight's value (e.g. `ndvi`), calculated for each zone by the API from the expression the insight stores and then aggregated with the insight's own statistic — you get a location, not a list of DGGS zones to interpret yourself. An insight that stores no expression for the collection returns one aggregated value per input field instead. It also returns `parquet_requests` for a map to draw the same values over the whole place itself; that data never passes through you. Zones that fail are listed under `errors`; the value comes from the zones that succeeded."
     )]
     async fn get_insight(
         &self,
@@ -168,13 +223,26 @@ impl DggsServer {
             self.grid(&dggrs_id, caller_token),
         );
         let props = props?;
-        // The insight's own bands, when the concept lists them for this
-        // collection; otherwise (e.g. an overridden collection) all fields.
-        let fields = match concept_fields(&concept, &collection_id) {
-            fields if fields.is_empty() => queryable_field_names(&props),
-            fields => fields,
+        // What the concept calculates on this collection. Its expressions
+        // are sent to the API as they are stored; nothing is rewritten here.
+        let derived = concept_properties(&concept, &collection_id);
+        // The stored fields read: the ones the expressions name; or the
+        // concept's own inputs; or (e.g. an overridden collection) all fields.
+        let inputs = match derived.input_fields(|name| props.contains_key(name)) {
+            inputs if !inputs.is_empty() => inputs,
+            _ => match concept_fields(&concept, &collection_id) {
+                fields if fields.is_empty() => queryable_field_names(&props),
+                fields => fields,
+            },
         };
-        let finest = finest_gsd(&props, &fields);
+        // The fields reported: the calculated ones when there are any,
+        // otherwise the stored ones.
+        let (fields, stored) = if derived.is_empty() {
+            (inputs.clone(), inputs.clone())
+        } else {
+            (derived.names(), Vec::new())
+        };
+        let finest = finest_gsd(&props, &inputs);
         let live_imagery = is_live_imagery(datetime, finest);
         let levels = choose_levels(&grid, width_m(&req.extent), finest, req.zone_level, live_imagery);
         let map_limit = map_request_limit(live_imagery);
@@ -197,11 +265,13 @@ impl DggsServer {
         let zones_truncated = zones_matched > MAX_ZONES_PER_QUERY;
         let zone_ids = sample_evenly(zone_ids, MAX_ZONES_PER_QUERY);
 
-        let fetches = bounded(
-            zone_ids
-                .iter()
-                .map(|zone_id| self.zone_values(&collection_id, &dggrs_id, zone_id, datetime, caller_token)),
-        );
+        let read = ZoneRead {
+            collection_id: &collection_id,
+            dggrs_id: &dggrs_id,
+            datetime,
+            derived: &derived,
+        };
+        let fetches = bounded(zone_ids.iter().map(|zone_id| self.zone_values(&read, zone_id, caller_token)));
         let parents =
             self.map_parent_ids(&collection_id, &dggrs_id, &req.extent, levels.parent, map_limit, caller_token);
         let (results, parents) = futures::join!(fetches, parents);
@@ -222,7 +292,9 @@ impl DggsServer {
         let stats = property_stats(&props);
         let mut values = serde_json::Map::new();
         for (col, samples) in &per_property {
-            let (stat, unit) = stats.get(col).cloned().unwrap_or((None, None));
+            let (stat, unit) = concept_output_stat(&concept, col)
+                .or_else(|| stats.get(col).cloned())
+                .unwrap_or((None, None));
             let mut summary = aggregate_property(samples, stat);
             summary["unit"] = serde_json::json!(unit);
             values.insert(col.clone(), summary);
@@ -240,7 +312,7 @@ impl DggsServer {
         });
         let map_collections = [CollectionSelectionInput {
             collection_id: collection_id.clone(),
-            fields,
+            fields: stored,
             alias: None,
             filter: None,
             all_fields: false,
@@ -251,7 +323,7 @@ impl DggsServer {
             &dggrs_id,
             &levels,
             &parents,
-            &map_collections,
+            MapSelection { collections: &map_collections, derived: &derived },
             datetime,
         );
         if !errors.is_empty() {
@@ -262,9 +334,10 @@ impl DggsServer {
 
     /// Resolve a caller-supplied insight name/id to its full concept detail
     /// (`GET /concepts/{id}`), which carries the collections that serve it
-    /// and the bands it reads from each. Matches numeric ids directly;
+    /// and what it calculates on each. Matches numeric ids directly;
     /// otherwise looks the name up (case-insensitive, exact match preferred
-    /// over substring) against `GET /concepts`.
+    /// over substring) against `GET /concepts`, and when nothing matches,
+    /// among each concept's `aliases` (which only its detail carries).
     async fn resolve_concept(&self, insight: &str, caller_token: Option<&str>) -> Result<Value, McpError> {
         if let Ok(id) = insight.parse::<u64>() {
             return self
@@ -314,11 +387,34 @@ impl DggsServer {
 
         match candidates.as_slice() {
             [] => {
-                let available = names(&list.iter().collect::<Vec<_>>());
-                Err(McpError::invalid_params(
-                    format!("no insight matches \"{insight}\". Available: {available}"),
-                    None,
-                ))
+                let ids: Vec<u64> = list.iter().filter_map(|c| c.get("id").and_then(Value::as_u64)).collect();
+                let details = bounded(ids.iter().map(|id| {
+                    let path = format!("/concepts/{id}");
+                    async move { self.client.get_json(&path, &[], caller_token).await }
+                }))
+                .await;
+                let mut by_alias: Vec<Value> = details
+                    .into_iter()
+                    .filter_map(Result::ok)
+                    .filter(|detail| has_alias(detail, insight.trim()))
+                    .collect();
+                match by_alias.len() {
+                    1 => Ok(by_alias.remove(0)),
+                    0 => {
+                        let available = names(&list.iter().collect::<Vec<_>>());
+                        Err(McpError::invalid_params(
+                            format!("no insight matches \"{insight}\". Available: {available}"),
+                            None,
+                        ))
+                    }
+                    _ => Err(McpError::invalid_params(
+                        format!(
+                            "\"{insight}\" is another name of several insights: {}. Use one of these names.",
+                            names(&by_alias.iter().collect::<Vec<_>>())
+                        ),
+                        None,
+                    )),
+                }
             }
             [single] => {
                 let id = single
@@ -340,23 +436,27 @@ impl DggsServer {
     }
 
     /// A single zone's own property values (`zone-depth=0`: one value per
-    /// property, not an expansion into sub-zones).
+    /// property, not an expansion into sub-zones). With derived fields, the
+    /// API calculates them and returns only those.
     async fn zone_values(
         &self,
-        collection_id: &str,
-        dggrs_id: &str,
+        read: &ZoneRead<'_>,
         zone_id: &str,
-        datetime: Option<&str>,
         caller_token: Option<&str>,
     ) -> Result<HashMap<String, Value>, McpError> {
         let path = format!(
             "/collections/{}/dggs/{}/zones/{}/data",
-            enc(collection_id),
-            enc(dggrs_id),
+            enc(read.collection_id),
+            enc(read.dggrs_id),
             enc(zone_id)
         );
+        let aliases = read.derived.query_pairs();
         let mut query = vec![("zone-depth", "0".to_string())];
-        query.extend(time_query(datetime));
+        query.extend(time_query(read.datetime));
+        query.extend(aliases.iter().map(|(key, expression)| (key.as_str(), expression.clone())));
+        if !read.derived.is_empty() {
+            query.push(("properties", read.derived.names().join(",")));
+        }
         let body = self.client.get_json(&path, &query, caller_token).await?;
         let values = body
             .get("values")
@@ -414,6 +514,45 @@ mod tests {
         assert_eq!(fields, vec!["B12_20m", "B8A_20m"]);
         assert!(concept_fields(&concept, "canada_dem").is_empty());
         assert!(concept_fields(&serde_json::json!({}), "sentinel-2-l2a").is_empty());
+    }
+
+    #[test]
+    fn concept_properties_are_the_expressions_stored_for_that_collection() {
+        // Arrange
+        let concept = serde_json::json!({
+            "sources": [
+                {"collection_id": "a", "properties": {"ratio": "(b8 - b4) / (b8 + b4)"}},
+                {"collection_id": "b", "inputs": {"x": "x"}}
+            ]
+        });
+
+        // Act
+        let on_a = concept_properties(&concept, "a");
+
+        // Assert
+        assert_eq!(on_a.names(), vec!["ratio"]);
+        assert_eq!(on_a.query_pairs()[0].1, "(b8 - b4) / (b8 + b4)");
+        assert!(concept_properties(&concept, "b").is_empty());
+        assert!(concept_properties(&concept, "c").is_empty());
+    }
+
+    #[test]
+    fn the_output_field_takes_the_concepts_stat_and_unit() {
+        let concept = serde_json::json!({"output": {"field": "ratio", "stat": "max", "unit": null}});
+
+        assert_eq!(concept_output_stat(&concept, "ratio"), Some((Some("max".to_string()), None)));
+        assert_eq!(concept_output_stat(&concept, "b4"), None);
+        assert_eq!(concept_output_stat(&serde_json::json!({}), "ratio"), None);
+    }
+
+    #[test]
+    fn an_alias_matches_whatever_its_letter_case() {
+        let concept = serde_json::json!({"aliases": ["greenness", "Vegetation Index"]});
+
+        assert!(has_alias(&concept, "GREENNESS"));
+        assert!(has_alias(&concept, "vegetation index"));
+        assert!(!has_alias(&concept, "green"));
+        assert!(!has_alias(&serde_json::json!({}), "greenness"));
     }
 
     #[test]
