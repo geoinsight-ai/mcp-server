@@ -21,14 +21,16 @@ RUN mkdir -p src && echo 'fn main() {}' > src/main.rs
 RUN cargo build --release
 
 # ---- application layer ------------------------------------------------------
-# Real sources. Remove the stub's own crate artifacts so the real binary is
+# Real sources. Clean the stub's own crate artifacts so the real binary is
 # always rebuilt from actual code, independent of source-file mtimes, while
-# every dependency stays cached from the layer above.
+# every dependency stays cached from the layer above. `cargo clean -p` knows
+# where the artifacts are; deleting them by path broke when cargo 1.100 moved
+# them, and the image then shipped the empty stub. The size check fails the
+# build if that ever happens again (the stub is under 1 MB).
 COPY src src
-RUN rm -rf target/release/ogc-dggs-mcp \
-           target/release/deps/ogc_dggs_mcp-* \
-           target/release/.fingerprint/ogc-dggs-mcp-* && \
-    cargo build --release
+RUN cargo clean --release -p ogc-dggs-mcp && \
+    cargo build --release && \
+    test "$(stat -c %s target/release/ogc-dggs-mcp)" -gt 1000000
 
 # ---- runtime ----
 FROM ubuntu:24.04
