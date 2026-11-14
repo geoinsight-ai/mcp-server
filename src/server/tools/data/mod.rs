@@ -1,6 +1,8 @@
 mod parquet;
 mod rows;
 
+use std::collections::BTreeMap;
+
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, tool, tool_router};
@@ -30,7 +32,7 @@ pub(super) struct CollectionSelectionInput {
     #[schemars(description = "Fields to return from this collection, as listed under `fields` by get_collection. Omit to return every field of the collection — do that for imagery unless the user names specific bands, so the map offers all of them.")]
     #[serde(default)]
     pub(super) fields: Vec<String>,
-    #[schemars(description = "Rename this collection's output column prefix (columns come back named \"prefix__field\"). Needed to select the same collection twice under different filters.")]
+    #[schemars(description = "Rename this collection's output column prefix (columns come back named \"prefix__field\"). Needed to select the same collection twice under different filters. This is not a calculated value: for those see `derived_fields`.")]
     pub(super) alias: Option<String>,
     #[schemars(description = "CQL2-text predicate restricting which of this collection's source rows contribute, e.g. \"length > 500\". Only supported for DuckDB-backed collections.")]
     pub(super) filter: Option<String>,
@@ -49,6 +51,10 @@ struct GetDataRequest {
     #[schemars(description = "One or more collections to read, each with the fields to return. Fields from different collections are joined on the same DGGS zone in one call; output columns are named \"prefix__field\" (prefix = alias or collection_id).")]
     collections: Vec<CollectionSelectionInput>,
 
+    #[schemars(description = "Values to calculate for each zone from the selected fields: a map of new column name to a CQL2-Text arithmetic expression (numbers, field names, `+ - * / % ^`, parentheses; no functions, no comparisons). Example: {\"ratio\": \"(a - b) / (a + b)\"}. With exactly one collection that has no `alias` and no `filter`, write its bare field names; otherwise write the output column names \"prefix__field\". A name must not equal a stored field and an expression cannot use another derived field. The API calculates on the zone's values, never on pixels; the result is null where an input is missing or it divides by zero. Stored values are used as they are: if a collection's description says its numbers need a scale or offset, write that into the expression. The fields an expression reads must be listed in that collection's `fields` (or `fields` omitted).")]
+    #[serde(default)]
+    derived_fields: BTreeMap<String, String>,
+
     #[schemars(description = "DGGRS grid to compute on. Omit to use the first listed collection's default grid.")]
     dggrs_id: Option<String>,
     #[schemars(description = "DGGS zone level the map draws: the Parquet requests expand to it from parent zones the grid's default depth above. Omit it (the usual case) to have it chosen from the size of the place and the resolution of the data; set it only to force coarser or finer detail.")]
@@ -57,6 +63,30 @@ struct GetDataRequest {
     zone_depth: Option<String>,
     #[schemars(description = "Instant or interval to filter temporal data (e.g. satellite imagery), RFC 3339 like \"2024-08-01T00:00:00Z/2024-08-31T23:59:59Z\"; bare dates (\"2024-08-01/2024-08-31\") cover whole days. Pass the dates the user asked for; omit for none.")]
     datetime: Option<String>,
+}
+
+/// What one zone read of `get_data` asks for, besides the collections.
+struct RowRead<'a> {
+    dggrs_id: &'a str,
+    zone_depth: Option<&'a str>,
+    datetime: Option<&'a str>,
+    derived: &'a DerivedFields,
+}
+
+impl RowRead<'_> {
+    /// The query both data routes take: depth, time, and the derived fields'
+    /// `alias[name]` definitions.
+    fn query(&self) -> Vec<(String, String)> {
+        let mut query = vec![("zone-depth".to_string(), self.zone_depth.unwrap_or("0").to_string())];
+        query.extend(time_query(self.datetime).into_iter().map(|(key, value)| (key.to_string(), value)));
+        query.extend(self.derived.query_pairs());
+        query
+    }
+}
+
+/// Borrowed `(key, value)` pairs in the form the API client takes.
+fn borrowed(query: &[(String, String)]) -> Vec<(&str, String)> {
+    query.iter().map(|(key, value)| (key.as_str(), value.clone())).collect()
 }
 
 /// The cross-collection POST body for `collections`.
@@ -71,10 +101,20 @@ pub(super) fn collections_body(collections: &[CollectionSelectionInput]) -> Valu
     })
 }
 
+/// A column of the per-collection GET under the name `get_data` reports:
+/// `zone_id` and the derived fields as they are, a stored field as
+/// `collection__field`.
+fn column_for(collection_id: &str, derived_names: &[String], column: String, value: Value) -> (String, Value) {
+    if column == "zone_id" || derived_names.contains(&column) {
+        return (column, value);
+    }
+    (format!("{collection_id}__{column}"), value)
+}
+
 #[tool_router(router = data_router, vis = "pub(crate)")]
 impl DggsServer {
     #[tool(
-        description = "Get raw field values from one or more collections at a location or area — the low-level counterpart to get_insight. Use this when you already know which collection(s) and field(s) you want (optionally joining several collections' fields together, e.g. elevation plus country name, in one call), rather than going through a named insight. Unlike get_insight this does not aggregate down to one number: for up to 20 matched zones it returns one flat row per zone (`zone_id` plus one column per field, named \"prefix__field\"); for more, a per-field `summary` (min/mean/max, or the most common values) instead. A point returns the single zone containing it. It also returns `parquet_requests`: requests (method, url, body) covering the whole area, one per parent zone, for a map to fetch and draw directly — the full data, which never needs to pass through you. Zone levels are chosen for you from the size of the place and the resolution of the data, so you don't need to pick one. Each collection's `fields` can be omitted to return all of its fields (see get_collection for what they are). If a collection has no data at a zone, the other collections' values are still returned and the failure is listed under `errors`. Works without Auth0 configured."
+        description = "Get raw field values from one or more collections at a location or area — the low-level counterpart to get_insight. Use this when you already know which collection(s) and field(s) you want (optionally joining several collections' fields together, e.g. elevation plus country name, in one call), rather than going through a named insight. Unlike get_insight this does not aggregate down to one number: for up to 20 matched zones it returns one flat row per zone (`zone_id` plus one column per field, named \"prefix__field\"); for more, a per-field `summary` (min/mean/max, or the most common values) instead. A point returns the single zone containing it. It also returns `parquet_requests`: requests (method, url, body) covering the whole area, one per parent zone, for a map to fetch and draw directly — the full data, which never needs to pass through you. Zone levels are chosen for you from the size of the place and the resolution of the data, so you don't need to pick one. Each collection's `fields` can be omitted to return all of its fields (see get_collection for what they are). To calculate a value that is not stored (an index, a ratio, a difference between collections), pass `derived_fields`: the API evaluates your expression for each zone and returns it as an extra column, which the map requests draw as well; use this when no insight covers what the user asks for. If a collection has no data at a zone, the other collections' values are still returned and the failure is listed under `errors`. Works without Auth0 configured."
     )]
     async fn get_data(
         &self,
@@ -94,6 +134,7 @@ impl DggsServer {
         let bbox = build_bbox(&req.extent)?;
         let datetime = req.datetime.as_deref().map(api_datetime).transpose()?;
         let datetime = datetime.as_deref();
+        let derived = DerivedFields::new(req.derived_fields.clone().into_iter().collect());
 
         // Every collection's queryables schema: the backend has no "all
         // fields" wildcard, so a collection with no `fields` gets every
@@ -154,16 +195,17 @@ impl DggsServer {
         let map_limit = map_request_limit(live_imagery);
         let parents = self.map_parent_ids(anchor, &dggrs_id, &req.extent, levels.parent, map_limit, caller_token);
 
-        let fetches = bounded(zone_ids.iter().map(|zone_id| {
-            self.zone_row(
-                &dggrs_id,
-                zone_id,
-                &collections,
-                req.zone_depth.as_deref(),
-                datetime,
-                caller_token,
-            )
-        }));
+        let read = RowRead {
+            dggrs_id: &dggrs_id,
+            zone_depth: req.zone_depth.as_deref(),
+            datetime,
+            derived: &derived,
+        };
+        let fetches = bounded(
+            zone_ids
+                .iter()
+                .map(|zone_id| self.zone_row(&read, zone_id, &collections, caller_token)),
+        );
         let (fetched, parents) = futures::join!(fetches, parents);
         let parents = parents?;
 
@@ -202,7 +244,7 @@ impl DggsServer {
             &dggrs_id,
             &levels,
             &parents,
-            MapSelection { collections: &request_collections, derived: &DerivedFields::none() },
+            MapSelection { collections: &request_collections, derived: &derived },
             datetime,
         );
         if !excluded.is_empty() {
@@ -221,17 +263,15 @@ impl DggsServer {
     /// body rather than a flattened map, since `get_data` doesn't reduce.
     async fn cross_collection_data(
         &self,
-        dggrs_id: &str,
+        read: &RowRead<'_>,
         zone_id: &str,
         body: &Value,
-        zone_depth: Option<&str>,
-        datetime: Option<&str>,
         caller_token: Option<&str>,
     ) -> Result<Value, McpError> {
-        let path = format!("/dggs/{}/zones/{}/data", enc(dggrs_id), enc(zone_id));
-        let mut query = vec![("zone-depth", zone_depth.unwrap_or("0").to_string())];
-        query.extend(time_query(datetime));
-        self.client.post_json(&path, &query, body, caller_token).await
+        let path = format!("/dggs/{}/zones/{}/data", enc(read.dggrs_id), enc(zone_id));
+        self.client
+            .post_json(&path, &borrowed(&read.query()), body, caller_token)
+            .await
     }
 
     /// One collection's row at one zone, columns named `prefix__field` as
@@ -239,41 +279,33 @@ impl DggsServer {
     /// filter) goes through the per-collection GET instead, which is the
     /// only endpoint that accepts ids like `sentinel-2-l2a` (the POST
     /// rejects hyphens with 422); its columns come back bare and are
-    /// prefixed here.
+    /// prefixed here, except the derived fields, which keep their own names.
     async fn collection_row(
         &self,
-        dggrs_id: &str,
+        read: &RowRead<'_>,
         zone_id: &str,
         collection: &CollectionSelectionInput,
-        zone_depth: Option<&str>,
-        datetime: Option<&str>,
         caller_token: Option<&str>,
     ) -> Result<serde_json::Map<String, Value>, McpError> {
         if !is_plain(collection) {
             let body = collections_body(std::slice::from_ref(collection));
-            let body = self
-                .cross_collection_data(dggrs_id, zone_id, &body, zone_depth, datetime, caller_token)
-                .await?;
+            let body = self.cross_collection_data(read, zone_id, &body, caller_token).await?;
             return Ok(flatten_zone_data(zone_id, &body));
         }
         let path = format!(
             "/collections/{}/dggs/{}/zones/{}/data",
             enc(&collection.collection_id),
-            enc(dggrs_id),
+            enc(read.dggrs_id),
             enc(zone_id)
         );
-        let mut query = vec![
-            ("zone-depth", zone_depth.unwrap_or("0").to_string()),
-            ("properties", collection.fields.join(",")),
-        ];
-        query.extend(time_query(datetime));
-        let body = self.client.get_json(&path, &query, caller_token).await?;
+        let derived_names = read.derived.names();
+        let returned: Vec<String> = collection.fields.iter().cloned().chain(derived_names.clone()).collect();
+        let mut query = read.query();
+        query.push(("properties".to_string(), returned.join(",")));
+        let body = self.client.get_json(&path, &borrowed(&query), caller_token).await?;
         Ok(flatten_zone_data(zone_id, &body)
             .into_iter()
-            .map(|(column, value)| match column.as_str() {
-                "zone_id" => (column, value),
-                field => (format!("{}__{field}", collection.collection_id), value),
-            })
+            .map(|(column, value)| column_for(&collection.collection_id, &derived_names, column, value))
             .collect())
     }
 
@@ -283,36 +315,39 @@ impl DggsServer {
     /// one the POST can't name (`sentinel-2-l2a`), which would also throw
     /// away every other collection's values. So on failure with several
     /// collections, read each one alone and keep what succeeds; only the
-    /// collections that really failed are reported.
+    /// collections that really failed are reported. Read alone, a collection
+    /// comes without the derived fields: their expressions are written
+    /// against the joined columns.
     async fn zone_row(
         &self,
-        dggrs_id: &str,
+        read: &RowRead<'_>,
         zone_id: &str,
         collections: &[CollectionSelectionInput],
-        zone_depth: Option<&str>,
-        datetime: Option<&str>,
         caller_token: Option<&str>,
     ) -> (Option<serde_json::Map<String, Value>>, Vec<Value>) {
         if let [only] = collections {
-            return match self.collection_row(dggrs_id, zone_id, only, zone_depth, datetime, caller_token).await {
+            return match self.collection_row(read, zone_id, only, caller_token).await {
                 Ok(row) => (Some(row), Vec::new()),
                 Err(err) => (None, vec![zone_error(zone_id, Some(&only.collection_id), &err)]),
             };
         }
         let joined = self
-            .cross_collection_data(dggrs_id, zone_id, &collections_body(collections), zone_depth, datetime, caller_token)
+            .cross_collection_data(read, zone_id, &collections_body(collections), caller_token)
             .await;
         if let Ok(body) = joined {
             return (Some(flatten_zone_data(zone_id, &body)), Vec::new());
         }
 
+        let stored_only = RowRead {
+            dggrs_id: read.dggrs_id,
+            zone_depth: read.zone_depth,
+            datetime: read.datetime,
+            derived: &DerivedFields::none(),
+        };
         let mut row: Option<serde_json::Map<String, Value>> = None;
         let mut errors = Vec::new();
         for collection in collections {
-            match self
-                .collection_row(dggrs_id, zone_id, collection, zone_depth, datetime, caller_token)
-                .await
-            {
+            match self.collection_row(&stored_only, zone_id, collection, caller_token).await {
                 Ok(values) => row.get_or_insert_with(serde_json::Map::new).extend(values),
                 Err(err) => errors.push(zone_error(zone_id, Some(&collection.collection_id), &err)),
             }
@@ -324,6 +359,48 @@ impl DggsServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stored_fields_get_the_collection_prefix_and_derived_fields_do_not() {
+        let derived = vec!["ratio".to_string()];
+        let name = |column: &str| column_for("dem", &derived, column.to_string(), Value::Null).0;
+
+        assert_eq!(name("band1_mean"), "dem__band1_mean");
+        assert_eq!(name("ratio"), "ratio");
+        assert_eq!(name("zone_id"), "zone_id");
+    }
+
+    #[test]
+    fn a_zone_read_defines_its_derived_fields_in_the_query() {
+        // Arrange
+        let derived = DerivedFields::new(vec![("ratio".to_string(), "a / b".to_string())]);
+        let read = RowRead { dggrs_id: "IVEA7H", zone_depth: None, datetime: None, derived: &derived };
+
+        // Act
+        let query = read.query();
+
+        // Assert
+        assert_eq!(
+            query,
+            vec![
+                ("zone-depth".to_string(), "0".to_string()),
+                ("alias[ratio]".to_string(), "a / b".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn derived_fields_are_optional_in_the_request() {
+        let without: GetDataRequest =
+            serde_json::from_str(r#"{"lon": 1.0, "lat": 2.0, "collections": [{"collection_id": "dem"}]}"#).unwrap();
+        let with: GetDataRequest = serde_json::from_str(
+            r#"{"lon": 1.0, "lat": 2.0, "collections": [{"collection_id": "dem"}], "derived_fields": {"double": "band1_mean * 2"}}"#,
+        )
+        .unwrap();
+
+        assert!(without.derived_fields.is_empty());
+        assert_eq!(with.derived_fields["double"], "band1_mean * 2");
+    }
 
     #[test]
     fn omitted_fields_deserialize_as_empty() {

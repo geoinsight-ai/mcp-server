@@ -73,6 +73,16 @@ backend's cross-collection body; leave `fields` out to get every field in the co
 model, and **Parquet requests** a map fetches and draws itself, so the full data never
 passes through the model or this server.
 
+`derived_fields` (optional, `{ name: expression }`) adds values the API calculates for
+each zone from the selected fields, e.g. `{ "ratio": "(a - b) / (a + b)" }`. This is how
+the model answers a request no insight covers: it reads a collection's fields and
+description with `get_collection` and writes the formula itself. The expression is
+CQL2-Text arithmetic and is sent unchanged as `alias[name]=expression`; with one plain
+collection it uses bare field names, otherwise the `prefix__field` column names. The
+calculated columns appear in `rows`/`summary` under their own names and in the
+`parquet_requests`. This is separate from a collection's `alias`, which only renames its
+column prefix.
+
 1. Picks a DGGRS grid (first listed collection's `GET .../dggs`, preferring `IVEA7H`
    when available — see gotcha below — unless overridden).
 2. Chooses the zone levels from the place and the data (see [Zone levels](#zone-levels)).
