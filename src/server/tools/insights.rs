@@ -175,7 +175,7 @@ impl DggsServer {
     }
 
     #[tool(
-        description = "Get an insight's value for a location or area — the main data-access tool. Pass an insight (e.g. \"ndvi\", \"burn_scar_analysis\"; see list_insights) and either a point (lon/lat) or an area (min_lon/min_lat/max_lon/max_lat). This resolves the insight's data source, picks DGGS zone levels from the size of the place and the data's resolution, samples the zone(s) covering the location (the single zone containing a point; up to 64 zones spread evenly across an area), and returns the insight's value (e.g. `ndvi`), calculated for each zone by the API from the expression the insight stores and then aggregated with the insight's own statistic — you get a location, not a list of DGGS zones to interpret yourself. An insight that stores no expression for the collection returns one aggregated value per input field instead. It also returns `parquet_requests` for a map to draw the same values over the whole place itself; that data never passes through you. Zones that fail are listed under `errors`; the value comes from the zones that succeeded."
+        description = "Get an insight's value for a location or area — the main data-access tool. Pass an insight (e.g. \"ndvi\", \"burn_scar_analysis\"; see list_insights) and either a point (lon/lat) or an area (min_lon/min_lat/max_lon/max_lat). This resolves the insight's data source, picks DGGS zone levels from the size of the place and the data's resolution, samples the zone(s) covering the location (the single zone containing a point; up to 64 zones spread evenly across an area), and returns the insight's value (e.g. `ndvi`), calculated for each zone by the API from the expression the insight stores and then aggregated with the insight's own statistic — you get a location, not a list of DGGS zones to interpret yourself. An insight that stores no expression for the collection returns one aggregated value per input field instead. It also returns `parquet_requests` for a map to draw the same values over the whole place itself; that data never passes through you. If no insight fits what the user asks for, use get_data with `derived_fields` and write the expression yourself. Zones that fail are listed under `errors`; the value comes from the zones that succeeded."
     )]
     async fn get_insight(
         &self,
@@ -403,7 +403,11 @@ impl DggsServer {
                     0 => {
                         let available = names(&list.iter().collect::<Vec<_>>());
                         Err(McpError::invalid_params(
-                            format!("no insight matches \"{insight}\". Available: {available}"),
+                            format!(
+                                "no insight matches \"{insight}\". Available: {available}. If none fits, \
+                                 read a collection's fields and description with get_collection and \
+                                 calculate the value with get_data's `derived_fields`."
+                            ),
                             None,
                         ))
                     }
