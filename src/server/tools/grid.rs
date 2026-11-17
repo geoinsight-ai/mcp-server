@@ -91,6 +91,8 @@ fn zone_summary(dggrs_id: &str, zone_id: &str, info: &Value, level: Option<u32>)
 #[tool_router(router = grid_router, vis = "pub(crate)")]
 impl DggsServer {
     #[tool(
+        title = "Get zone",
+        annotations(read_only_hint = true),
         description = "Describe one DGGS zone without reading any data: its level, centroid (lon, lat), bbox, area and width, and the ids of its parent (one level coarser), children (the zones one level finer that overlap it — 13 on IVEA7H, not just the 7 inside it) and neighbours (same level). Use it to move around the grid — up to a wider zone, down into finer ones, or sideways — before deciding where to query data. Works without Auth0 configured."
     )]
     async fn get_zone(
@@ -116,6 +118,8 @@ impl DggsServer {
     }
 
     #[tool(
+        title = "List zones",
+        annotations(read_only_hint = true),
         description = "List the DGGS zones covering a place, without reading any data: the zone containing a point (lon/lat), or every zone intersecting a bbox, at one level. Omit zone_level to start at the place's own level (a few zones cover it), then go finer with a higher level or get_zone's children. Returns the zone ids (at most 100; `zones_matched` and `truncated` say if there were more) and the level's typical zone width. Works without Auth0 configured."
     )]
     async fn list_zones(
