@@ -41,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
             let service = server.serve(rmcp::transport::stdio()).await?;
             service.waiting().await?;
         }
-        Transport::Http { bind_addr, allowed_hosts } => {
+        Transport::Http { bind_addr, allowed_hosts, public_url } => {
             // Checked in AppConfig::from_env(): HTTP mode always has
             // http_auth set, or the process already panicked at startup.
             let http_auth = config
@@ -53,11 +53,13 @@ async fn main() -> anyhow::Result<()> {
                 public_base_url = %config.public_base_url,
                 %bind_addr,
                 ?allowed_hosts,
+                ?public_url,
                 "starting ogc-dggs-mcp (http)"
             );
 
+            let discovery = public_url.map(|url| http_transport::OAuthDiscovery::new(&url, &http_auth.domain));
             let validator = Arc::new(BearerValidator::new(http_auth, reqwest::Client::new()));
-            http_transport::serve(client, bind_addr, allowed_hosts, validator).await?;
+            http_transport::serve(client, bind_addr, allowed_hosts, validator, discovery).await?;
         }
     }
 

@@ -38,6 +38,12 @@ pub enum Transport {
         /// MUST be set to the real ingress hostname(s) in any real
         /// deployment or every request 400s on Host validation.
         allowed_hosts: Vec<String>,
+        /// This server's own public origin, e.g. `https://mcp.geoinsight.ai`
+        /// (`MCP_PUBLIC_URL`). Needed to advertise OAuth discovery
+        /// (RFC 9728) so clients like claude.ai can find Auth0 on a 401;
+        /// without it, 401s carry no discovery hint and only clients that
+        /// already hold a token can connect.
+        public_url: Option<String>,
     },
 }
 
@@ -111,7 +117,13 @@ impl AppConfig {
                     Ok(hosts) => hosts.split(',').map(|h| h.trim().to_string()).collect(),
                     Err(_) => vec!["localhost".to_string(), "127.0.0.1".to_string(), "::1".to_string()],
                 };
-                Transport::Http { bind_addr, allowed_hosts }
+                let public_url = env::var("MCP_PUBLIC_URL")
+                    .ok()
+                    .map(|url| url.trim_end_matches('/').to_string());
+                if public_url.is_none() {
+                    tracing::warn!("MCP_PUBLIC_URL not set: 401s won't advertise OAuth discovery metadata");
+                }
+                Transport::Http { bind_addr, allowed_hosts, public_url }
             }
             other => panic!("MCP_TRANSPORT must be \"stdio\" or \"http\", got {other:?}"),
         };
