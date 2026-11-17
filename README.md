@@ -1,4 +1,4 @@
-# ogc-dggs-mcp
+# GeoInsight's MCP for the Spatial Intelligence Layer for AI
 
 An MCP (Model Context Protocol) server, written in Rust with [rmcp](https://github.com/modelcontextprotocol/rust-sdk),
 that exposes geoinsight's [`ogc-dggs-api`](../ogc-dggs-api) as **task-shaped** tools for
