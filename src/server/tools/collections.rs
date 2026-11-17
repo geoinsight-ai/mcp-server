@@ -113,6 +113,8 @@ fn field_summaries(props: &serde_json::Map<String, Value>) -> Vec<Value> {
 #[tool_router(router = collections_router, vis = "pub(crate)")]
 impl DggsServer {
     #[tool(
+        title = "List collections",
+        annotations(read_only_hint = true),
         description = "List the data collections that have data at a place: each one's id, title, bbox (\"global\" when it covers anywhere) and dates. Pass the place's point (lon/lat) or bbox, the same one you'll query — the full catalogue is close to a thousand collections, far too many to read, and only the ones overlapping the place (plus global ones) are returned. For Sentinel-2 imagery use `sentinel-2-l2a`, which combines every scene in a date range, rather than the single-scene `S2A_…`/`S2B_…` collections. Use get_collection for one collection's fields."
     )]
     async fn list_collections(
@@ -137,6 +139,8 @@ impl DggsServer {
     }
 
     #[tool(
+        title = "Get collection",
+        annotations(read_only_hint = true),
         description = "Describe a single data collection: its extent, temporal range, links, and `fields` — each field's name, type, title, unit and how it aggregates across zones (`stat`). Use the field names with get_data, or omit them there to get every field."
     )]
     async fn get_collection(
