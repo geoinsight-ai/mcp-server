@@ -14,6 +14,7 @@ use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use crate::bearer_auth::BearerValidator;
 use crate::client::ApiClient;
 use crate::server::DggsServer;
+use crate::usage::CallerId;
 
 /// OAuth 2.0 Protected Resource Metadata (RFC 9728), which is how an MCP
 /// client that only has this server's URL (claude.ai connectors) finds out
@@ -106,7 +107,7 @@ pub async fn serve(
 
 async fn require_bearer(
     State(AuthState { validator, discovery }): State<AuthState>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Response {
     let Some(token) = request
@@ -124,6 +125,8 @@ async fn require_bearer(
             // the actual authorization decision downstream is ogc-dggs-api
             // re-validating this same forwarded token itself.
             tracing::info!(sub = %claims.sub, "authenticated MCP request");
+            // For the per-call `usage` log (`src/usage.rs`).
+            request.extensions_mut().insert(CallerId(claims.sub));
             next.run(request).await
         }
         Err(err) => {
