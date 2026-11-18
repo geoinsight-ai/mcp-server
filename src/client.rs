@@ -159,6 +159,7 @@ impl ApiClient {
                 .try_clone()
                 .ok_or_else(|| McpError::internal_error("request to ogc-dggs-api can't be retried", None))?;
             let request_number = self.request_count.fetch_add(1, Ordering::Relaxed) + 1;
+            crate::usage::count_backend_request();
 
             let response = this_try.send().await.map_err(|err| {
                 tracing::info!(request_number, method, %url, error = %err, "ogc-dggs-api call failed");

@@ -16,7 +16,8 @@ mod tools;
 use std::sync::Arc;
 
 use rmcp::handler::server::router::tool::ToolRouter;
-use rmcp::model::{ServerCapabilities, ServerInfo};
+use rmcp::handler::server::tool::ToolCallContext;
+use rmcp::model::{CallToolRequestParams, CallToolResponse, ServerCapabilities, ServerInfo};
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool_handler};
 use serde_json::Value;
@@ -138,6 +139,17 @@ impl DggsServer {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for DggsServer {
+    /// Defined here, so `#[tool_handler]` doesn't generate it, only to
+    /// log each call's `usage` event around the router's own dispatch.
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        let (logged, ctx) = (request.clone(), context.clone());
+        crate::usage::record(&logged, &ctx, self.tool_router.call(ToolCallContext::new(self, request, context))).await
+    }
+
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "Tools for geoinsight's ogc-dggs-api. Start with list_insights to see available \
