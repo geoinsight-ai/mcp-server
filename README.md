@@ -184,12 +184,86 @@ All configuration is via environment variables.
 | `AUTH0_CLIENT_SECRET` | only for `list_insights`/`get_insight` | — | Auth0 M2M application client secret |
 | `AUTH0_AUDIENCE` | only for `list_insights`/`get_insight` | — | API identifier configured on the Auth0 API (same value the ogc-dggs-api validates as `AUTH0_AUDIENCE`) |
 | `RUST_LOG` | no | `info` | Standard `tracing` filter |
+| `LOG_FORMAT` | no | plain text | `json` writes one JSON object per log line, for counting the [usage logs](#usage-logs) with `jq`. Set in every k8s environment |
 
 The server uses the Auth0 client-credentials (machine-to-machine) grant: it fetches a
 token from `https://{AUTH0_DOMAIN}/oauth/token` and caches/refreshes it automatically.
 All four `AUTH0_*` variables must be set together or auth is left disabled (`get_data`,
 `list_collections`/`get_collection` still work without it; `list_insights`/`get_insight`
 will fail with the backend's own 401).
+
+## Usage logs
+
+Every tool call writes one log event with target `usage`. It records who called which
+tool, with what arguments, how it went, and what it cost. With `LOG_FORMAT=json` it's
+one line like this (formatted here):
+
+```json
+{
+  "timestamp": "2026-11-18T10:12:03.418Z",
+  "level": "INFO",
+  "target": "usage",
+  "fields": {
+    "message": "tool call",
+    "caller": "auth0|0123456789abcdef01234567",
+    "tool": "get_data",
+    "arguments": "{\"collections\":[{\"collection_id\":\"worldpop_population\"}],\"lat\":38.57,\"lon\":-7.91}",
+    "outcome": "ok",
+    "duration_ms": 23304,
+    "backend_requests": 7
+  }
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `caller` | The caller's Auth0 user id (`sub`) over HTTP; `stdio` for the local transport |
+| `tool`, `arguments` | The tool called and its arguments, as JSON |
+| `outcome` | `ok`, `tool_error` (the tool answered with an error result) or `error` (the call failed; `error` holds the message) |
+| `duration_ms` | How long the call took |
+| `backend_requests` | Requests sent to ogc-dggs-api for this call, retries included. A single `get_insight`/`get_data` call can fan out to many |
+
+The events live in the pod's logs, so they only go back to the pod's last restart.
+Read them with `kubectl logs` (needs access to the cluster). The namespaces are
+`mcp-server-dev`, `mcp-server-mr` and `mcp-server-prod`. Change `--since` to pick the
+time window:
+
+```sh
+# The usage events of the last 24 hours, one JSON object each
+kubectl logs -n mcp-server-prod deploy/mcp-server --since=24h \
+  | jq -c 'select(.target=="usage") | .fields'
+
+# Calls per user
+kubectl logs -n mcp-server-prod deploy/mcp-server --since=24h \
+  | jq -r 'select(.target=="usage") | .fields.caller' | sort | uniq -c | sort -rn
+
+# Number of distinct users
+kubectl logs -n mcp-server-prod deploy/mcp-server --since=24h \
+  | jq -r 'select(.target=="usage") | .fields.caller' | sort -u | wc -l
+
+# Calls per tool and outcome
+kubectl logs -n mcp-server-prod deploy/mcp-server --since=24h \
+  | jq -r 'select(.target=="usage") | "\(.fields.tool) \(.fields.outcome)"' | sort | uniq -c | sort -rn
+
+# Failed calls, with their error
+kubectl logs -n mcp-server-prod deploy/mcp-server --since=24h \
+  | jq -c 'select(.target=="usage" and .fields.outcome!="ok") | .fields | {caller, tool, outcome, error}'
+
+# Slowest calls
+kubectl logs -n mcp-server-prod deploy/mcp-server --since=24h \
+  | jq -c 'select(.target=="usage") | .fields | {tool, duration_ms, backend_requests}' \
+  | jq -s 'sort_by(-.duration_ms) | .[:10]'
+```
+
+`deploy/mcp-server` reads one pod. If the deployment runs several replicas, use
+`-l app=mcp-server --prefix` instead, so you read all of them.
+
+To see who a `caller` is, look the id up in the Auth0 dashboard under User Management →
+Users. The id is logged rather than the email address, so the logs hold no email
+addresses. They do hold each call's arguments (places, dates, formulas) next to that id.
+
+Without `LOG_FORMAT=json` (local runs), the same events come out as plain text lines
+with `usage:` and `tool call` in them.
 
 ## Build
 

@@ -4,6 +4,7 @@ mod client;
 mod config;
 mod http_transport;
 mod server;
+mod usage;
 
 use std::sync::Arc;
 
@@ -21,10 +22,16 @@ async fn main() -> anyhow::Result<()> {
     // logging must go to stderr or it corrupts the protocol stream. HTTP
     // mode doesn't use stdout for protocol, but stderr logging is kept
     // consistent across both.
-    tracing_subscriber::fmt()
+    // LOG_FORMAT=json gives one JSON object per line (e.g. the `usage`
+    // events in `src/usage.rs`), for counting with jq or a log pipeline.
+    let subscriber = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
-        .init();
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()));
+    if std::env::var("LOG_FORMAT").is_ok_and(|format| format == "json") {
+        subscriber.json().init();
+    } else {
+        subscriber.init();
+    }
 
     let config = AppConfig::from_env();
     let client = ApiClient::new(&config);
