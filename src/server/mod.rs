@@ -161,7 +161,7 @@ impl ServerHandler for DggsServer {
              unaggregated per-zone values. If no insight covers what the user asks for (an \
              index, a ratio, a difference), write the formula yourself: read the fields and \
              the description with get_collection, then pass get_data's `derived_fields` and \
-             the API calculates it for each zone; list_collections(the place's lon/lat or bbox) \
+             the API calculates it for each zone; list_collections(the place's lon/lat or bbox, plus a keyword `query`) \
              finds the collections with data there, and get_collection their fields. list_zones \
              and get_zone move around the DGGS grid itself (the zones covering a place, a \
              zone's parent, children and neighbours) without reading any data. In stdio mode, list_insights and \

@@ -13,7 +13,17 @@ struct ListCollectionsRequest {
     /// The place to list collections for; omit for the whole catalogue.
     #[serde(flatten)]
     extent: ExtentArgs,
+    #[schemars(
+        description = "Keywords for the kind of data wanted, e.g. \"5G mobile fibre internet\" or \"earthquake seismic\". Matched against each collection's id, title and description; a collection matching any of them is listed, best matches first. Several synonyms help: titles often use the data provider's own wording."
+    )]
+    query: Option<String>,
 }
+
+/// At most this many collections are listed per call. Switzerland alone has
+/// ~940, ~230k characters of JSON: a client that truncates tool results
+/// (explore cuts at 20k) silently loses most of them, so instead the list
+/// stops here and says how to narrow it.
+const MAX_LISTED: usize = 50;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct CollectionIdRequest {
@@ -90,6 +100,66 @@ fn covers(collection: &Value, area: &[f64; 4]) -> bool {
     }
 }
 
+/// Lowercased search terms from a free-text query; one-character fragments
+/// (left over from e.g. "5-G") are dropped.
+fn search_terms(query: &str) -> Vec<String> {
+    query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|term| term.chars().count() > 1)
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// How well a collection matches `terms`: 2 for each term in its id or
+/// title, 1 for each found only in its description. 0 means no match.
+fn relevance(collection: &Value, terms: &[String]) -> usize {
+    let text = |key: &str| collection.get(key).and_then(Value::as_str).unwrap_or_default().to_lowercase();
+    let name = format!("{} {}", text("id"), text("title"));
+    let description = text("description");
+    terms
+        .iter()
+        .map(|term| match (name.contains(term.as_str()), description.contains(term.as_str())) {
+            (true, _) => 2,
+            (false, true) => 1,
+            (false, false) => 0,
+        })
+        .sum()
+}
+
+/// The collections at a place that match the query, in the order to list
+/// them: best match first with a query, otherwise global collections first
+/// (so imagery, population and boundaries survive the cap) and then by id.
+fn ranked_collections<'a>(all: &'a [Value], area: Option<&[f64; 4]>, terms: &[String]) -> Vec<&'a Value> {
+    let mut ranked: Vec<(usize, bool, &str, &Value)> = all
+        .iter()
+        .filter(|c| area.is_none_or(|area| covers(c, area)))
+        .map(|c| (relevance(c, terms), collection_bbox(c).is_some(), c.get("id").and_then(Value::as_str).unwrap_or_default(), c))
+        .filter(|(score, ..)| terms.is_empty() || *score > 0)
+        .collect();
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(b.2)));
+    ranked.into_iter().map(|(.., c)| c).collect()
+}
+
+/// The `list_collections` result: at most `MAX_LISTED` summaries, and when
+/// more matched, a note telling the model to narrow with `query`.
+fn listing(ranked: &[&Value], total: usize, searched: bool) -> Value {
+    let collections: Vec<Value> = ranked.iter().take(MAX_LISTED).map(|c| collection_summary(c)).collect();
+    let mut out = serde_json::json!({
+        "collections": collections,
+        "matched": ranked.len(),
+        "total": total,
+    });
+    if ranked.len() > MAX_LISTED {
+        out["truncated"] = Value::Bool(true);
+        out["note"] = Value::String(format!(
+            "Only the first {MAX_LISTED} of {} matching collections are listed{}. Call list_collections again with `query` set to keywords for the data wanted (and synonyms, e.g. \"5G mobile fibre internet\") to search every collection's title and description.",
+            ranked.len(),
+            if searched { ", best matches first" } else { ", global ones first" },
+        ));
+    }
+    out
+}
+
 /// A queryables schema as a compact field list for `get_collection`: what
 /// each field is and how it aggregates across zones, so the model can pick
 /// fields and explain values (e.g. "Total Parcel Area", summed).
@@ -115,7 +185,7 @@ impl DggsServer {
     #[tool(
         title = "List collections",
         annotations(title = "List collections", read_only_hint = true),
-        description = "List the data collections that have data at a place: each one's id, title, bbox (\"global\" when it covers anywhere) and dates. Pass the place's point (lon/lat) or bbox, the same one you'll query — the full catalogue is close to a thousand collections, far too many to read, and only the ones overlapping the place (plus global ones) are returned. For Sentinel-2 imagery use `sentinel-2-l2a`, which combines every scene in a date range, rather than the single-scene `S2A_…`/`S2B_…` collections. Use get_collection for one collection's fields."
+        description = "List the data collections that have data at a place: each one's id, title, bbox (\"global\" when it covers anywhere) and dates. Pass the place's point (lon/lat) or bbox, the same one you'll query — the full catalogue is close to a thousand collections, and only the ones overlapping the place (plus global ones) are returned. Some places (e.g. Switzerland, with hundreds of national datasets) still have far more than one call lists, so pass `query` with keywords for the kind of data wanted (several synonyms: \"5G mobile fibre broadband\"): it searches titles and descriptions and lists the best matches first. Without `query`, a result marked `truncated` is not the full list: search before saying data doesn't exist. For Sentinel-2 imagery use `sentinel-2-l2a`, which combines every scene in a date range, rather than the single-scene `S2A_…`/`S2B_…` collections. Use get_collection for one collection's fields."
     )]
     async fn list_collections(
         &self,
@@ -124,18 +194,11 @@ impl DggsServer {
     ) -> Result<String, McpError> {
         let caller_token = caller_bearer_token(&ctx);
         let area = optional_bbox(&req.extent)?;
+        let terms = req.query.as_deref().map(search_terms).unwrap_or_default();
         let body = self.client.get_json("/collections", &[], caller_token.as_deref()).await?;
         let all = body.get("collections").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
-        let collections: Vec<Value> = all
-            .iter()
-            .filter(|c| area.is_none_or(|area| covers(c, &area)))
-            .map(collection_summary)
-            .collect();
-        Ok(pretty(&serde_json::json!({
-            "collections": collections,
-            "matched": collections.len(),
-            "total": all.len(),
-        })))
+        let ranked = ranked_collections(all, area.as_ref(), &terms);
+        Ok(pretty(&listing(&ranked, all.len(), !terms.is_empty())))
     }
 
     #[tool(
@@ -227,6 +290,67 @@ mod tests {
         assert!(covers(&swiss, &[7.0, 46.0, 7.5, 46.5]));
         assert!(covers(&world, &jasper));
         assert!(covers(&serde_json::json!({"id": "no_extent"}), &jasper));
+    }
+
+    fn collection(id: &str, title: &str, description: &str, bbox: [f64; 4]) -> Value {
+        serde_json::json!({
+            "id": id, "title": title, "description": description,
+            "extent": {"spatial": {"bbox": [bbox]}},
+        })
+    }
+
+    #[test]
+    fn search_terms_are_lowercased_words() {
+        assert_eq!(search_terms("5G, Mobile/fibre-x"), vec!["5g", "mobile", "fibre"]);
+        assert!(search_terms("  ").is_empty());
+    }
+
+    #[test]
+    fn relevance_weights_title_over_description() {
+        let fivegee = collection("ch_bakom_mobilnetz_5g", "5G - NR availability", "access to modern telecommunications networks", [5.96, 45.82, 10.49, 47.81]);
+        assert_eq!(relevance(&fivegee, &search_terms("5g")), 2);
+        assert_eq!(relevance(&fivegee, &search_terms("telecommunications")), 1);
+        assert_eq!(relevance(&fivegee, &search_terms("5g telecommunications earthquake")), 3);
+        assert_eq!(relevance(&fivegee, &search_terms("earthquake")), 0);
+    }
+
+    #[test]
+    fn ranking_filters_by_place_and_query() {
+        // Arrange
+        let swiss = [5.96, 45.82, 10.49, 47.81];
+        let all = vec![
+            collection("ch_quake", "Past earthquakes", "seismic history", swiss),
+            collection("ch_5g", "5G availability", "mobile telecommunications", swiss),
+            collection("worldpop", "WorldPop", "population", [-180.0, -90.0, 180.0, 90.0]),
+            collection("ca_dem", "Canadian elevation", "terrain", [-141.0, 41.7, -52.6, 83.1]),
+        ];
+        let zermatt = [7.7, 46.0, 7.8, 46.1];
+        let ids = |ranked: Vec<&Value>| ranked.iter().map(|c| c["id"].as_str().unwrap_or_default().to_string()).collect::<Vec<_>>();
+
+        // Act / Assert: no query lists global collections first, then by id.
+        assert_eq!(ids(ranked_collections(&all, Some(&zermatt), &[])), vec!["worldpop", "ch_5g", "ch_quake"]);
+        // A query keeps only matches, best first.
+        assert_eq!(ids(ranked_collections(&all, Some(&zermatt), &search_terms("telecommunications 5g"))), vec!["ch_5g"]);
+        assert_eq!(ids(ranked_collections(&all, None, &search_terms("elevation"))), vec!["ca_dem"]);
+    }
+
+    #[test]
+    fn long_listings_are_capped_with_a_note() {
+        // Arrange
+        let many: Vec<Value> = (0..MAX_LISTED + 5).map(|i| collection(&format!("ch_{i:03}"), "Layer", "", [6.0, 46.0, 10.0, 47.0])).collect();
+        let ranked: Vec<&Value> = many.iter().collect();
+
+        // Act
+        let capped = listing(&ranked, 971, false);
+        let short = listing(&ranked[..3], 971, true);
+
+        // Assert
+        assert_eq!(capped["collections"].as_array().map(Vec::len), Some(MAX_LISTED));
+        assert_eq!(capped["matched"], MAX_LISTED + 5);
+        assert_eq!(capped["truncated"], true);
+        assert!(capped["note"].as_str().is_some_and(|n| n.contains("query")));
+        assert_eq!(short["collections"].as_array().map(Vec::len), Some(3));
+        assert!(short.get("truncated").is_none() && short.get("note").is_none());
     }
 
     #[test]

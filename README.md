@@ -18,7 +18,7 @@ routes are deliberately **not** exposed as tools at all.
 | `list_insights` | List available concepts (NDVI, burn scar analysis, ...) | `GET /concepts` |
 | `get_insight` | The main tool: one aggregated value of an insight at a point or over an area | `GET /concepts/{id}`, `GET /collections/{id}/dggs`, `GET .../zones`, `GET .../zones/{id}/data` (×N, concurrently), `GET /collections/{id}/queryables` |
 | `get_data` | Raw, unaggregated field values from one or more named collections at a location, optionally joined in one call | `GET /collections/{id}/dggs`, `GET .../zones`, `POST /dggs/{id}/zones/{id}/data` (×N, concurrently) |
-| `list_collections` | Browse raw dataset metadata directly (secondary/advanced) | `GET /collections` |
+| `list_collections` | Find datasets with data at a place, optionally searched by keywords (`query`); lists at most 50, best matches first | `GET /collections` |
 | `get_collection` | Describe one dataset, including its `fields` (name, type, title, unit, aggregation stat) | `GET /collections/{id}`, `GET /collections/{id}/queryables` |
 
 `list_insights` and `get_insight` need this server's Auth0 client-credentials configured
